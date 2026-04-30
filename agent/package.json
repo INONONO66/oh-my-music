@@ -1,0 +1,29 @@
+{
+  "name": "@oh-my-music/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "latest",
+    "@mariozechner/pi-agent-core": "latest",
+    "@mariozechner/pi-coding-agent": "latest",
+    "@msgpack/msgpack": "latest",
+    "@tensorflow/tfjs": "latest",
+    "@discordjs/opus": "latest",
+    "@discordjs/voice": "latest",
+    "discord.js": "latest",
+    "essentia.js": "latest",
+    "ink": "latest",
+    "ink-text-input": "latest",
+    "meyda": "latest",
+    "react": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
