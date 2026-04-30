@@ -13,3 +13,7 @@
 *.sqlite-shm
 *.sqlite-wal
 .sisyphus/
+
+# Local AI instructions (not committed)
+*.local.md
+*.local.ts
