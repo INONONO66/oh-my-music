@@ -1,0 +1,15 @@
+/target/
+/agent/node_modules/
+/agent/.env
+/.env
+*.log
+.DS_Store
+*.pcm
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.sisyphus/
