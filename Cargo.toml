@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  "crates/omm-audio",
+  "crates/omm-engine",
+  "crates/omm-protocol",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ino/oh-my-music"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+cpal = "0.17"
+glicol = { git = "https://github.com/chaosprint/glicol.git", rev = "0317db2e" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
