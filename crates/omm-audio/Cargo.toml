@@ -10,4 +10,12 @@ rust-version.workspace = true
 cpal.workspace = true
 glicol.workspace = true
 omm-protocol = { path = "../omm-protocol" }
+realfft.workspace = true
+ringbuf.workspace = true
+rubato.workspace = true
+serde.workspace = true
+symphonia.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
