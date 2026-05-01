@@ -1,7 +1,7 @@
 use glicol::Engine;
 
 use crate::dsp::SmoothedParam;
-use crate::frame::{db_to_gain, StereoFrame};
+use crate::frame::{StereoFrame, db_to_gain};
 use crate::source::AudioSource;
 
 const GLICOL_BLOCK_SIZE: usize = 128;
@@ -51,6 +51,11 @@ impl GlicolSource {
     }
 
     fn refill_residual(&mut self) {
+        // Glicol's `next_block` consumes a `Vec<&[f32]>` of optional input
+        // channels. This source is synth-only, so we hand it an empty vec.
+        // `Vec::new()` is guaranteed by std to not allocate (capacity 0), and
+        // Glicol's internal `is_empty()` guard skips the input copy entirely,
+        // so this stays alloc-free in the audio render path.
         let block = self.engine.next_block(Vec::new());
 
         for frame_index in 0..GLICOL_BLOCK_SIZE {
@@ -295,6 +300,26 @@ mod tests {
         let mut output = vec![StereoFrame::SILENCE; 384];
         source.render(&mut output);
 
+        assert_finite(&output);
+    }
+
+    #[test]
+    fn glicol_repeated_render_does_not_grow_residual_capacity() {
+        let mut source = GlicolSource::new(48_000);
+        render_test_code(&mut source);
+
+        let initial_capacity = source.residual.capacity();
+        let mut output = vec![StereoFrame::SILENCE; 256];
+
+        for _ in 0..1024 {
+            source.render(&mut output);
+        }
+
+        assert_eq!(
+            source.residual.capacity(),
+            initial_capacity,
+            "residual buffer should not reallocate during steady-state rendering"
+        );
         assert_finite(&output);
     }
 }
