@@ -82,7 +82,7 @@ SourceId::Player channel
   → SourceTimelineSnapshot
 ```
 
-The current implementation establishes the schema and fixed-channel bridge only. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`, not as future scheduler transport authority. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. Later implementation stages attach planned scheduling, dynamic file/generated layer allocation, source playback controls, and per-source effect automation to these source instances through validated handlers/adapters.
+The current implementation establishes the schema, fixed-channel bridge, and runtime-owned file source instances as a staged library primitive. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`; dynamic file instances reserve the `legacy:` instance-id namespace for fixed-channel bridges and report `PlaybackStatusAuthority::TimelineTransport`, URI/duration asset metadata, source offsets, playback position, and current gain/pan/filter status. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. The timeline placement currently records immutable placement intent; consumers must use `playback.state` as the runtime liveness authority for stopped or ended sources. Later implementation stages attach generated layer allocation, richer source transport, RT-safe prepared-source handoff, asset/instance deduplication, lifecycle cleanup, and per-source effect automation to these source instances through validated handlers/adapters.
 
 ### Source 특성
 
@@ -386,7 +386,7 @@ controller request
   → due commands applied from engine time during render-block boundaries
 ```
 
-This layer establishes scheduler semantics for RT commands. Later implementation stages attach timeline source creation/playback/effect operations to the same planned/immediate rules.
+This layer establishes scheduler semantics for RT commands. File source creation/playback controls are exposed as non-render runtime APIs today; the running-engine integration must decode/prepare assets off the render thread and hand bounded prepared-source or source-instance control commands into the RT side. Later implementation stages attach those controls and generated/effect operations to the same planned/immediate scheduler rules.
 
 ### 5.8 Core Audio Tap
 
@@ -712,7 +712,7 @@ type Envelope<T> = {
 
 ### 8.3 Agent → Engine Messages
 
-The table below separates implemented protocol rows from planned contract direction. The protocol includes dynamic source timeline schema/event types, a fixed-channel bridge, and planned/immediate scheduler semantics for RT commands; timeline source command handlers remain planned.
+The table below separates implemented protocol rows from planned contract direction. The protocol includes dynamic source timeline schema/event types, a fixed-channel bridge, runtime file source controls, and planned/immediate scheduler semantics for RT commands; IPC timeline source command handlers remain planned.
 
 | Kind | Purpose | Status |
 |------|---------|--------|

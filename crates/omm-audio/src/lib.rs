@@ -23,7 +23,9 @@ pub use features::{
 };
 pub use frame::StereoFrame;
 pub use meter::MeterSnapshot;
-pub use runtime::{AudioRuntime, AudioRuntimeConfig};
+pub use runtime::{
+    AudioRuntime, AudioRuntimeConfig, FileSourceInstanceRequest, SourceInstanceError,
+};
 pub use scheduler::{
     RtCommandScheduleRequest, RtCommandScheduler, RtCommandSchedulerError, ScheduledRtCommand,
 };

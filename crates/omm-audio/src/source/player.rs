@@ -84,6 +84,10 @@ impl PlayerSource {
         self.position = 0;
     }
 
+    pub fn seek_frames(&mut self, frame: u64) {
+        self.position = (frame as usize).min(self.frames.len());
+    }
+
     fn apply_gain(&mut self, frame: StereoFrame) -> StereoFrame {
         let gain = db_to_gain(self.gain_db.next_value());
         StereoFrame::new(frame.left * gain, frame.right * gain)
@@ -122,6 +126,23 @@ impl AudioSource for PlayerSource {
 
     fn set_gain_db(&mut self, gain_db: f32, ramp_frames: u32) {
         self.gain_db.set_target(gain_db, ramp_frames);
+    }
+
+    fn position_frames(&self) -> Option<u64> {
+        Some(self.position as u64)
+    }
+
+    fn duration_frames(&self) -> Option<u64> {
+        Some(self.frames.len() as u64)
+    }
+
+    fn seek_frames(&mut self, frame: u64) -> bool {
+        PlayerSource::seek_frames(self, frame);
+        true
+    }
+
+    fn is_finished(&self) -> bool {
+        PlayerSource::is_finished(self)
     }
 }
 
