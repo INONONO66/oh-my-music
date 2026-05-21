@@ -30,6 +30,8 @@ docs/              # architecture docs and ADRs
 
 Early scaffold. The architecture draft lives at [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The current audio-understanding foundation includes deterministic schema fixtures and Rust per-channel feature snapshots for dynamics, spectral texture, onset rate, zero-crossing rate, and coarse labels.
 
+`omm-engine timeline-demo` runs an offline v1 DJ timeline harness without an agent or UI. It creates overlapping file-backed sources, applies immediate per-source controls, verifies planned actions respect the 30-second lead-time rule, renders the scheduled transition, stops a source, and prints a JSON report with render/effect assertions.
+
 ## First Milestone
 
 Build an AI-independent Rust music control core first:
