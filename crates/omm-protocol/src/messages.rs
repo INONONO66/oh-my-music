@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::params::{ParamId, RtTarget, SourceId};
+use crate::source_timeline::SourceTimelineSnapshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionMode {
@@ -91,4 +92,5 @@ pub enum EngineEvent {
         system_audio: String,
         mic: String,
     },
+    SourceTimelineSnapshot(SourceTimelineSnapshot),
 }

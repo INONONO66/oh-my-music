@@ -11,7 +11,7 @@ use crate::meter::MeterSnapshot;
 use crate::mixer::Mixer;
 use crate::source::AudioSource;
 use crate::{ChannelStrip, FeatureAnalyzerHandle};
-use omm_protocol::SourceId;
+use omm_protocol::{SourceId, SourceTimelineSnapshot};
 use ringbuf::traits::Split;
 use ringbuf::HeapRb;
 
@@ -38,6 +38,7 @@ pub struct AudioRuntime {
     command_rx: CommandReceiver,
     last_meter: MeterSnapshot,
     feature_registry: FeatureRegistry,
+    rendered_frames: u64,
 }
 
 impl AudioRuntime {
@@ -59,6 +60,7 @@ impl AudioRuntime {
                 command_rx,
                 last_meter: MeterSnapshot::default(),
                 feature_registry,
+                rendered_frames: 0,
             },
             command_queue,
             analyzer,
@@ -102,6 +104,7 @@ impl AudioRuntime {
         self.limiter.process(output);
         nan_guard_and_clamp(output);
         self.last_meter = MeterSnapshot::compute(output);
+        self.rendered_frames = self.rendered_frames.saturating_add(output.len() as u64);
     }
 
     pub fn meters(&self) -> &MeterSnapshot {
@@ -110,6 +113,23 @@ impl AudioRuntime {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Builds a non-real-time status snapshot for control surfaces and IPC adapters.
+    ///
+    /// This method allocates a `Vec` and must not be called from the audio render callback.
+    /// It is intentionally a legacy fixed-channel adapter until dynamic timeline transport
+    /// state is introduced by later scheduler/playback PRs.
+    pub fn source_timeline_snapshot(&self) -> SourceTimelineSnapshot {
+        SourceTimelineSnapshot {
+            engine_frame: self.rendered_frames,
+            sample_rate: self.sample_rate,
+            sources: self
+                .channels
+                .iter()
+                .map(ChannelStrip::timeline_source_snapshot)
+                .collect(),
+        }
     }
 
     pub fn set_master_gain_db(&mut self, db: f32, ramp_frames: u32) {
@@ -247,7 +267,7 @@ mod tests {
     use super::*;
     use crate::features::ChannelFeatures;
     use crate::source::{GlicolSource, TestToneSource};
-    use omm_protocol::SourceId;
+    use omm_protocol::{PlaybackState, SourceId, SourceKind};
 
     const SAMPLE_RATE: u32 = 48_000;
     const FRAME_COUNT: usize = 128;
@@ -635,6 +655,48 @@ mod tests {
         let meters = runtime.meters();
         assert!(meters.peak_left > 0.0, "left peak should update");
         assert!(meters.peak_right > 0.0, "right peak should update");
+    }
+
+    #[test]
+    fn runtime_reports_legacy_channels_as_timeline_source_instances() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        add_test_channel(
+            &mut runtime,
+            SourceId::Player,
+            Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+        );
+        assert!(queue
+            .enqueue(RtCommand::SetChannelGainDb {
+                source_id: SourceId::Player,
+                db: -9.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetChannelPan {
+                source_id: SourceId::Player,
+                pan: 0.5,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+        assert_eq!(snapshot.engine_frame, 256);
+        assert_eq!(snapshot.sample_rate, SAMPLE_RATE);
+        assert_eq!(snapshot.sources.len(), 1);
+        let source = &snapshot.sources[0];
+        assert_eq!(source.source_instance_id.as_str(), "legacy:player");
+        assert_eq!(source.source_kind, SourceKind::File);
+        assert_eq!(source.playback.state, PlaybackState::Playing);
+        assert_eq!(source.effects.gain_db, -9.0);
+        assert_eq!(source.effects.pan, 0.5);
+        assert_eq!(source.legacy_bridge.unwrap().source_id, SourceId::Player);
+        assert!(source.timeline.is_active_at(0));
     }
 
     #[test]
