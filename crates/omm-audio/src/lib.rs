@@ -1,6 +1,7 @@
 pub mod channel;
 pub mod command;
 pub mod constants;
+pub mod demo;
 pub mod dsp;
 pub mod features;
 pub mod frame;
@@ -19,6 +20,10 @@ pub use command::{
     RT_SOURCE_INSTANCE_ID_CAPACITY,
 };
 pub use constants::{ENGINE_CHANNELS, ENGINE_SAMPLE_RATE, MAX_BLOCK_FRAMES};
+pub use demo::{
+    run_timeline_dj_demo, DemoSourceEffects, TimelineDjDemoConfig, TimelineDjDemoError,
+    TimelineDjDemoReport,
+};
 pub use features::{
     BrightnessLabel, ChannelFeatures, EnergyLabel, FeatureAnalyzerHandle, TextureLabel, Trend,
 };

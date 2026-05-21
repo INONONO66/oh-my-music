@@ -388,7 +388,20 @@ controller request
 
 This layer establishes scheduler semantics for RT commands. File source creation/playback controls are exposed as non-render runtime APIs today; the running-engine integration must decode/prepare assets off the render thread and hand bounded prepared-source or source-instance control commands into the RT side. Later implementation stages attach those controls and generated/effect operations to the same planned/immediate scheduler rules.
 
-### 5.8 Core Audio Tap
+### 5.8 Offline Timeline DJ Demo Harness
+
+`omm_audio::run_timeline_dj_demo` and `omm-engine timeline-demo` provide the current end-to-end v1 acceptance harness without requiring an agent brain, UI, Discord bot, or live audio device. The harness is intentionally offline and deterministic:
+
+- creates two file-backed timeline source instances that play concurrently;
+- applies immediate/manual per-source commands for gain, pan, high-pass, low-pass, three-band EQ, reverb send, playback rate, and reverse;
+- rejects a planned LLM action scheduled before `engine_now + 30_000ms`;
+- accepts planned LLM/Pi actions at the 30-second engine-frame boundary and renders until they apply;
+- stops one source and reports timeline playback state;
+- returns a JSON-serializable report with source counts, render peaks, effect snapshots, planned trigger/apply frames, and stop state.
+
+This proves the core DJ timeline contract in-process. It does not try to provide production packaging, a Pi-agent decision loop, or a UI transport; those remain outside the v1 engine harness boundary.
+
+### 5.9 Core Audio Tap
 
 ```
 Core Audio Process Tap

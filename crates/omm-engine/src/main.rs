@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use cpal::traits::StreamTrait;
 use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource};
-use omm_audio::{AudioRuntime, AudioRuntimeConfig, RtCommand};
+use omm_audio::{run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand};
 use omm_engine::cpal_io::CpalIo;
 use omm_protocol::SourceId;
 use ringbuf::traits::Consumer;
@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
             run_glicol(&args[2]).await?;
         }
         "mix-demo" => run_mix_demo().await?,
+        "timeline-demo" => run_timeline_demo()?,
         "mic-test" => run_mic_test().await?,
         "mic-monitor" => run_mic_monitor().await?,
         unknown => {
@@ -59,12 +60,14 @@ fn usage_text() -> String {
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"<glicol code>\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n\n");
     text.push_str("  omm-engine mic-monitor\n\n");
     text.push_str("Examples:\n");
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"out: sin 440 >> mul 0.1\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n");
     text.push_str("  omm-engine mic-monitor\n");
     text
@@ -186,6 +189,12 @@ async fn run_mix_demo() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn run_timeline_demo() -> anyhow::Result<()> {
+    let report = run_timeline_dj_demo(Default::default())?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 async fn run_mic_test() -> anyhow::Result<()> {
@@ -319,6 +328,10 @@ mod tests {
         );
         assert!(text.contains("glicol"), "usage missing glicol: {text}");
         assert!(text.contains("mix-demo"), "usage missing mix-demo: {text}");
+        assert!(
+            text.contains("timeline-demo"),
+            "usage missing timeline-demo: {text}"
+        );
         assert!(text.contains("mic-test"), "usage missing mic-test: {text}");
         assert!(
             text.contains("mic-monitor"),
