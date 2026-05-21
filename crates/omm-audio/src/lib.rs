@@ -8,6 +8,7 @@ pub mod meter;
 pub mod mixer;
 pub mod output;
 pub mod runtime;
+pub mod scheduler;
 pub mod source;
 pub mod understanding;
 
@@ -23,6 +24,9 @@ pub use features::{
 pub use frame::StereoFrame;
 pub use meter::MeterSnapshot;
 pub use runtime::{AudioRuntime, AudioRuntimeConfig};
+pub use scheduler::{
+    RtCommandScheduleRequest, RtCommandScheduler, RtCommandSchedulerError, ScheduledRtCommand,
+};
 pub use understanding::{
     AudioUnderstandingConfig, OfflineAudioUnderstandingAnalyzer, SemanticAudioUnderstanding,
 };

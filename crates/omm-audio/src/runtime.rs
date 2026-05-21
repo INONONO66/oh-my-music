@@ -10,7 +10,10 @@ use crate::frame::StereoFrame;
 use crate::meter::MeterSnapshot;
 use crate::mixer::Mixer;
 use crate::source::AudioSource;
-use crate::{ChannelStrip, FeatureAnalyzerHandle};
+use crate::{
+    ChannelStrip, FeatureAnalyzerHandle, RtCommandScheduleRequest, RtCommandScheduler,
+    RtCommandSchedulerError,
+};
 use omm_protocol::{SourceId, SourceTimelineSnapshot};
 use ringbuf::traits::Split;
 use ringbuf::HeapRb;
@@ -38,6 +41,7 @@ pub struct AudioRuntime {
     command_rx: CommandReceiver,
     last_meter: MeterSnapshot,
     feature_registry: FeatureRegistry,
+    scheduler: RtCommandScheduler,
     rendered_frames: u64,
 }
 
@@ -60,6 +64,7 @@ impl AudioRuntime {
                 command_rx,
                 last_meter: MeterSnapshot::default(),
                 feature_registry,
+                scheduler: RtCommandScheduler::default(),
                 rendered_frames: 0,
             },
             command_queue,
@@ -90,7 +95,8 @@ impl AudioRuntime {
     }
 
     pub fn render_block(&mut self, output: &mut [StereoFrame]) {
-        self.drain_commands();
+        let drained_commands = self.drain_commands(MAX_DRAIN_PER_BLOCK);
+        self.drain_scheduled_commands(MAX_DRAIN_PER_BLOCK.saturating_sub(drained_commands));
 
         if output.is_empty() {
             return;
@@ -115,11 +121,56 @@ impl AudioRuntime {
         self.sample_rate
     }
 
-    /// Builds a non-real-time status snapshot for control surfaces and IPC adapters.
+    /// Schedules an RT command against the runtime's current engine-frame position.
     ///
-    /// This method allocates a `Vec` and must not be called from the audio render callback.
-    /// It is intentionally a legacy fixed-channel adapter until dynamic timeline transport
-    /// state is introduced by later scheduler/playback PRs.
+    /// Planned LLM/Pi origins must satisfy the protocol lead-time guard. Immediate
+    /// manual/test/emergency origins may target the current frame. This is a
+    /// non-render/control-side API because scheduler mutation may allocate or shift
+    /// control structures; do not call it from the audio callback.
+    pub fn schedule_rt_command(
+        &mut self,
+        request: RtCommandScheduleRequest,
+    ) -> Result<(), RtCommandSchedulerError> {
+        self.scheduler
+            .schedule(request, self.rendered_frames, self.sample_rate)
+    }
+
+    /// Cancels a scheduled command from the non-render/control side.
+    pub fn cancel_scheduled_rt_command(
+        &mut self,
+        action_id: &omm_protocol::ScheduledActionId,
+    ) -> Result<crate::ScheduledRtCommand, RtCommandSchedulerError> {
+        self.scheduler.cancel(action_id)
+    }
+
+    /// Modifies a scheduled command trigger from the non-render/control side.
+    ///
+    /// Planned origins are revalidated against the runtime's current engine frame.
+    pub fn modify_scheduled_rt_command_trigger(
+        &mut self,
+        action_id: &omm_protocol::ScheduledActionId,
+        new_trigger_frame: u64,
+    ) -> Result<(), RtCommandSchedulerError> {
+        self.scheduler.modify_trigger_frame(
+            action_id,
+            new_trigger_frame,
+            self.rendered_frames,
+            self.sample_rate,
+        )
+    }
+
+    pub fn scheduled_rt_command_count(&self) -> usize {
+        self.scheduler.len()
+    }
+
+    /// Reclaims scheduler metadata for already-dispatched commands.
+    ///
+    /// This is a non-render/control-side maintenance API and must not run on the
+    /// audio callback path.
+    pub fn reclaim_dispatched_scheduled_rt_commands(&mut self) -> usize {
+        self.scheduler.reclaim_dispatched_metadata()
+    }
+
     pub fn source_timeline_snapshot(&self) -> SourceTimelineSnapshot {
         SourceTimelineSnapshot {
             engine_frame: self.rendered_frames,
@@ -198,10 +249,10 @@ impl AudioRuntime {
         }
     }
 
-    fn drain_commands(&mut self) -> usize {
+    fn drain_commands(&mut self, max: usize) -> usize {
         let mut count = 0;
 
-        while count < MAX_DRAIN_PER_BLOCK {
+        while count < max {
             let mut next_command = None;
             let drained = self
                 .command_rx
@@ -216,6 +267,21 @@ impl AudioRuntime {
             }
 
             count += drained;
+        }
+
+        count
+    }
+
+    fn drain_scheduled_commands(&mut self, max: usize) -> usize {
+        let mut count = 0;
+
+        while count < max {
+            let Some(cmd) = self.scheduler.pop_next_due(self.rendered_frames) else {
+                break;
+            };
+
+            self.apply_command(cmd);
+            count += 1;
         }
 
         count
@@ -267,7 +333,9 @@ mod tests {
     use super::*;
     use crate::features::ChannelFeatures;
     use crate::source::{GlicolSource, TestToneSource};
-    use omm_protocol::{PlaybackState, SourceId, SourceKind};
+    use omm_protocol::{
+        ActionOrigin, EngineTime, PlaybackState, ScheduledActionId, SourceId, SourceKind,
+    };
 
     const SAMPLE_RATE: u32 = 48_000;
     const FRAME_COUNT: usize = 128;
@@ -492,6 +560,53 @@ mod tests {
     }
 
     #[test]
+    fn immediate_and_scheduled_commands_share_one_render_budget() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        add_test_channel(
+            &mut runtime,
+            SourceId::Glicol,
+            Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+        );
+
+        for _ in 0..MAX_DRAIN_PER_BLOCK {
+            queue
+                .enqueue(RtCommand::SetMasterGainDb {
+                    db: -60.0,
+                    ramp_frames: 0,
+                })
+                .expect("queue has capacity");
+        }
+        runtime
+            .schedule_rt_command(RtCommandScheduleRequest {
+                action_id: ScheduledActionId::new("restore-on-next-budget"),
+                origin: ActionOrigin::Test,
+                trigger_frame: 0,
+                command: RtCommand::SetMasterGainDb {
+                    db: 0.0,
+                    ramp_frames: 0,
+                },
+            })
+            .expect("due scheduled action accepted");
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+        assert!(
+            peak(&output) < 0.01,
+            "scheduled action must wait when immediate queue consumes the block budget"
+        );
+        assert_eq!(runtime.scheduled_rt_command_count(), 1);
+
+        runtime.render_block(&mut output);
+        assert!(
+            peak(&output) > 0.3,
+            "scheduled action should drain on the next block once budget is available"
+        );
+        assert_eq!(runtime.scheduled_rt_command_count(), 0);
+    }
+
+    #[test]
     fn runtime_master_gain_zero_keeps_normal_amplitude() {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
@@ -655,6 +770,101 @@ mod tests {
         let meters = runtime.meters();
         assert!(meters.peak_left > 0.0, "left peak should update");
         assert!(meters.peak_right > 0.0, "right peak should update");
+    }
+
+    #[test]
+    fn runtime_applies_due_scheduled_commands_on_engine_frame() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        add_test_channel(
+            &mut runtime,
+            SourceId::Player,
+            Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+        );
+
+        runtime
+            .schedule_rt_command(RtCommandScheduleRequest {
+                action_id: ScheduledActionId::new("mute-at-frame-256"),
+                origin: ActionOrigin::Test,
+                trigger_frame: 256,
+                command: RtCommand::SetChannelEnabled {
+                    source_id: SourceId::Player,
+                    enabled: false,
+                },
+            })
+            .expect("test action can be scheduled at an exact engine frame");
+
+        let mut first = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut first);
+        assert!(peak(&first) > 0.1, "source should play before trigger");
+        assert_eq!(runtime.scheduled_rt_command_count(), 1);
+
+        let mut second = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut second);
+        let second_peak = peak(&second);
+        assert!(
+            second_peak < 0.05,
+            "due command disables source at frame 256 after filter tail, got peak {second_peak}"
+        );
+        assert_eq!(runtime.scheduled_rt_command_count(), 0);
+    }
+
+    #[test]
+    fn runtime_exposes_non_render_scheduler_reclaim() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        runtime
+            .schedule_rt_command(RtCommandScheduleRequest {
+                action_id: ScheduledActionId::new("reclaim-runtime"),
+                origin: ActionOrigin::Test,
+                trigger_frame: 0,
+                command: RtCommand::SetMasterGainDb {
+                    db: -6.0,
+                    ramp_frames: 0,
+                },
+            })
+            .expect("due scheduled action accepted");
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+        assert_eq!(runtime.scheduled_rt_command_count(), 0);
+        assert_eq!(runtime.reclaim_dispatched_scheduled_rt_commands(), 1);
+        assert_eq!(runtime.reclaim_dispatched_scheduled_rt_commands(), 0);
+    }
+
+    #[test]
+    fn runtime_rejects_planned_commands_inside_thirty_second_guard() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let minimum = EngineTime::new(0, SAMPLE_RATE).frame_after_ms(30_000);
+
+        let early = runtime.schedule_rt_command(RtCommandScheduleRequest {
+            action_id: ScheduledActionId::new("too-early"),
+            origin: ActionOrigin::PlannedLlm,
+            trigger_frame: minimum - 1,
+            command: RtCommand::SetMasterGainDb {
+                db: -6.0,
+                ramp_frames: 0,
+            },
+        });
+        assert!(early.is_err());
+        assert_eq!(runtime.scheduled_rt_command_count(), 0);
+
+        runtime
+            .schedule_rt_command(RtCommandScheduleRequest {
+                action_id: ScheduledActionId::new("planned-ok"),
+                origin: ActionOrigin::PlannedLlm,
+                trigger_frame: minimum,
+                command: RtCommand::SetMasterGainDb {
+                    db: -6.0,
+                    ramp_frames: 0,
+                },
+            })
+            .expect("planned LLM action at now+30s is accepted");
+        assert_eq!(runtime.scheduled_rt_command_count(), 1);
     }
 
     #[test]
