@@ -4,7 +4,7 @@ use crate::dsp::{
 };
 use crate::frame::StereoFrame;
 use crate::source::AudioSource;
-use omm_protocol::SourceId;
+use omm_protocol::{SourceEffectStatus, SourceId, SourcePlaybackStatus, TimelineSourceInstance};
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 
@@ -39,6 +39,22 @@ impl ChannelStrip {
 
     pub fn source_id(&self) -> SourceId {
         self.source_id
+    }
+
+    pub fn timeline_source_snapshot(&self) -> TimelineSourceInstance {
+        let playback = SourcePlaybackStatus::legacy_enabled(self.enabled);
+
+        TimelineSourceInstance::legacy_channel(self.source_id, playback, self.effect_status())
+    }
+
+    fn effect_status(&self) -> SourceEffectStatus {
+        SourceEffectStatus {
+            gain_db: self.gain_db.current(),
+            pan: self.pan.current(),
+            highpass_hz: self.highpass.cutoff_hz(),
+            lowpass_hz: self.lowpass.cutoff_hz(),
+            ..SourceEffectStatus::default()
+        }
     }
 
     pub fn render(&mut self, output: &mut [StereoFrame]) {

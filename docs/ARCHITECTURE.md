@@ -60,6 +60,30 @@ oh-my-music는 4가지 사운드 소스를 믹싱한다:
 | **Selected Song** | 유저가 선택한 로컬 음악 파일 (MP3, WAV, FLAC) | 파일 디코딩 → 버퍼 |
 | **Coded Sound (Glicol)** | LLM이 Glicol 코드를 생성하여 만든 프로그래매틱 사운드 | Glicol Engine (Rust 네이티브) |
 
+
+### 2.1 Timeline Source Instance Model
+
+The runtime now has a protocol-level dynamic source model above the current fixed `SourceId` channels. Each audible stream is represented as a `TimelineSourceInstance` with:
+
+- stable `source_instance_id` such as `legacy:mic` or a future scheduled layer id
+- `source_kind`: `System`, `Mic`, `File`, or `Generated`
+- optional `asset_ref` for live input, file URI/hash/duration, or generated engine/code reference
+- one or more `active_windows` with `timeline_start_ms`, optional `timeline_end_ms`, and `source_start_offset_ms`
+- `playback` status (`Pending`, `Queued`, `Playing`, `Paused`, `Stopped`, `Ended`, `Failed`) plus an authority marker (`TimelineTransport` vs `LegacyChannelEnabled`)
+- current per-source effect status: gain, pan, HPF/LPF, EQ, reverb send, playback rate, reverse flag
+- optional `legacy_bridge` that maps an existing fixed `SourceId` channel into the dynamic model
+- validation contract for non-empty/namespace-safe ids and non-empty, sorted, non-overlapping active windows
+
+```text
+SourceId::Player channel
+  → SourceInstanceId("legacy:player")
+  → SourceKind::File
+  → TimelineSourceInstance
+  → SourceTimelineSnapshot
+```
+
+PR2 establishes the schema and fixed-channel bridge only. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`, not as future scheduler transport authority. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. Later PRs attach planned scheduling, dynamic file/generated layer allocation, source playback controls, and per-source effect automation to these source instances through validated handlers/adapters.
+
 ### Source 특성
 
 **System Audio:**
@@ -664,7 +688,7 @@ type Envelope<T> = {
 
 ### 8.3 Agent → Engine Messages
 
-The table below separates implemented protocol rows from planned contract direction. PR1 only adds the offline audio-understanding foundation and does not add new IPC commands/events.
+The table below separates implemented protocol rows from planned contract direction. PR2 adds dynamic source timeline schema/event types and a fixed-channel bridge; runtime scheduling/command handlers remain planned for later PRs.
 
 | Kind | Purpose | Status |
 |------|---------|--------|
@@ -696,6 +720,7 @@ The table below separates implemented protocol rows from planned contract direct
 | `ChannelFeatures` / future `AnalysisPcmChunk` | 현재 Rust feature snapshot 또는 향후 PCM 분석 청크 (PR1은 아직 IPC 이벤트를 추가하지 않고 오디오 이해 스키마/오프라인 분석 기반만 정의) | planned |
 | `DiscordPcmFrame` | Discord 출력 프레임 (20ms, 3840 bytes) | planned |
 | `CaptureStatus` | 캡처 상태 변경 알림 | implemented |
+| `SourceTimelineSnapshot` | dynamic source instances with active windows/playback/effect status | schema implemented / emission planned |
 | `XRunEvent` | 오디오 드롭아웃 알림 | planned |
 
 ### 8.5 Reconnection
