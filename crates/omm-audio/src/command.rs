@@ -256,6 +256,28 @@ mod tests {
 
     #[test]
     fn rt_command_defines_expected_variants() {
+        fn assert_variant_is_covered(command: RtCommand) {
+            match command {
+                RtCommand::SetMasterGainDb { .. }
+                | RtCommand::SetMasterPan { .. }
+                | RtCommand::SetMasterLowpassHz { .. }
+                | RtCommand::SetMasterHighpassHz { .. }
+                | RtCommand::SetChannelGainDb { .. }
+                | RtCommand::SetChannelPan { .. }
+                | RtCommand::SetChannelLowpassHz { .. }
+                | RtCommand::SetChannelHighpassHz { .. }
+                | RtCommand::SetChannelEnabled { .. }
+                | RtCommand::SetSourceInstanceGainDb { .. }
+                | RtCommand::SetSourceInstancePan { .. }
+                | RtCommand::SetSourceInstanceHighpassHz { .. }
+                | RtCommand::SetSourceInstanceLowpassHz { .. }
+                | RtCommand::SetSourceInstanceEq { .. }
+                | RtCommand::SetSourceInstanceReverbSendDb { .. }
+                | RtCommand::SetSourceInstancePlaybackRate { .. }
+                | RtCommand::SetSourceInstanceReverse { .. } => {}
+            }
+        }
+
         let commands = [
             RtCommand::SetMasterGainDb {
                 db: -6.0,
@@ -330,6 +352,8 @@ mod tests {
             },
         ];
 
-        assert_eq!(commands.len(), 17);
+        for command in commands {
+            assert_variant_is_covered(command);
+        }
     }
 }

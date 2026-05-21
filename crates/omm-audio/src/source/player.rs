@@ -89,7 +89,11 @@ impl PlayerSource {
     }
 
     pub fn restart(&mut self) {
-        self.position = 0.0;
+        self.position = if self.reverse {
+            self.frames.len().saturating_sub(1) as f64
+        } else {
+            0.0
+        };
     }
 
     pub fn seek_frames(&mut self, frame: u64) {
@@ -727,6 +731,31 @@ mod tests {
         let replayed = render(&mut source, 4);
 
         for (left, right) in first.iter().zip(replayed.iter()) {
+            assert_near(left.left, right.left);
+            assert_near(left.right, right.right);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_rearms_reverse_from_end() -> Result<(), PlayerSourceError> {
+        let bytes = stereo_wav(48_000, 16, 440.0);
+        let mut source = PlayerSource::from_bytes(&bytes, 48_000)?;
+
+        source.set_reverse(true);
+        let first_reverse = render(&mut source, 4);
+        render(&mut source, 20);
+        assert!(source.is_finished());
+
+        source.restart();
+        assert_eq!(
+            source.position_frames(),
+            source.duration_frames().saturating_sub(1)
+        );
+        assert!(!source.is_finished());
+        let replayed_reverse = render(&mut source, 4);
+
+        for (left, right) in first_reverse.iter().zip(replayed_reverse.iter()) {
             assert_near(left.left, right.left);
             assert_near(left.right, right.right);
         }

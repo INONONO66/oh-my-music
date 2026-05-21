@@ -101,6 +101,8 @@ pub struct AudioRuntime {
     feature_registry: FeatureRegistry,
     scheduler: RtCommandScheduler,
     rendered_frames: u64,
+    dropped_source_instance_rt_commands: u64,
+    unsupported_source_instance_rt_commands: u64,
 }
 
 impl AudioRuntime {
@@ -124,6 +126,8 @@ impl AudioRuntime {
                 feature_registry,
                 scheduler: RtCommandScheduler::default(),
                 rendered_frames: 0,
+                dropped_source_instance_rt_commands: 0,
+                unsupported_source_instance_rt_commands: 0,
             },
             command_queue,
             analyzer,
@@ -482,6 +486,14 @@ impl AudioRuntime {
         self.sample_rate
     }
 
+    pub fn dropped_source_instance_rt_commands(&self) -> u64 {
+        self.dropped_source_instance_rt_commands
+    }
+
+    pub fn unsupported_source_instance_rt_commands(&self) -> u64 {
+        self.unsupported_source_instance_rt_commands
+    }
+
     /// Schedules an RT command against the runtime's current engine-frame position.
     ///
     /// Planned LLM/Pi origins must satisfy the protocol lead-time guard. Immediate
@@ -659,6 +671,27 @@ impl AudioRuntime {
         count
     }
 
+    fn observe_source_instance_command_result(&mut self, result: Result<(), SourceInstanceError>) {
+        if let Err(error) = result {
+            match error {
+                SourceInstanceError::UnsupportedSourceOperation { .. } => {
+                    self.unsupported_source_instance_rt_commands = self
+                        .unsupported_source_instance_rt_commands
+                        .saturating_add(1);
+                }
+                SourceInstanceError::SourceInstanceNotFound { .. }
+                | SourceInstanceError::Validation(_)
+                | SourceInstanceError::DuplicateSourceInstance { .. }
+                | SourceInstanceError::ReservedSourceInstanceId { .. }
+                | SourceInstanceError::StartOffsetBeyondDuration { .. }
+                | SourceInstanceError::Player(_) => {
+                    self.dropped_source_instance_rt_commands =
+                        self.dropped_source_instance_rt_commands.saturating_add(1);
+                }
+            }
+        }
+    }
+
     fn apply_command(&mut self, cmd: RtCommand) {
         match cmd {
             RtCommand::SetMasterGainDb { db, ramp_frames } => {
@@ -701,26 +734,30 @@ impl AudioRuntime {
                 db,
                 ramp_frames,
             } => {
-                let _ = self.set_source_instance_gain_db(&source_instance_id, db, ramp_frames);
+                let result = self.set_source_instance_gain_db(&source_instance_id, db, ramp_frames);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstancePan {
                 source_instance_id,
                 pan,
                 ramp_frames,
             } => {
-                let _ = self.set_source_instance_pan(&source_instance_id, pan, ramp_frames);
+                let result = self.set_source_instance_pan(&source_instance_id, pan, ramp_frames);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceHighpassHz {
                 source_instance_id,
                 hz,
             } => {
-                let _ = self.set_source_instance_highpass_hz(&source_instance_id, hz);
+                let result = self.set_source_instance_highpass_hz(&source_instance_id, hz);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceLowpassHz {
                 source_instance_id,
                 hz,
             } => {
-                let _ = self.set_source_instance_lowpass_hz(&source_instance_id, hz);
+                let result = self.set_source_instance_lowpass_hz(&source_instance_id, hz);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceEq {
                 source_instance_id,
@@ -729,38 +766,42 @@ impl AudioRuntime {
                 high_db,
                 ramp_frames,
             } => {
-                let _ = self.set_source_instance_eq_gains_db(
+                let result = self.set_source_instance_eq_gains_db(
                     &source_instance_id,
                     low_db,
                     mid_db,
                     high_db,
                     ramp_frames,
                 );
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceReverbSendDb {
                 source_instance_id,
                 send_db,
                 ramp_frames,
             } => {
-                let _ = self.set_source_instance_reverb_send_db(
+                let result = self.set_source_instance_reverb_send_db(
                     &source_instance_id,
                     send_db,
                     ramp_frames,
                 );
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstancePlaybackRate {
                 source_instance_id,
                 rate,
                 ramp_frames,
             } => {
-                let _ =
+                let result =
                     self.set_source_instance_playback_rate(&source_instance_id, rate, ramp_frames);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceReverse {
                 source_instance_id,
                 reverse,
             } => {
-                let _ = self.set_source_instance_reverse(&source_instance_id, reverse);
+                let result = self.set_source_instance_reverse(&source_instance_id, reverse);
+                self.observe_source_instance_command_result(result);
             }
         }
     }
@@ -2044,6 +2085,39 @@ mod tests {
             p > 0.5,
             "expected Glicol channel unaffected by unknown source command, got peak {p}"
         );
+    }
+
+    #[test]
+    fn source_instance_rt_command_failures_are_counted() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        add_test_channel(
+            &mut runtime,
+            SourceId::Glicol,
+            Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+        );
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: SourceInstanceId::new("file:missing"),
+                db: -6.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstancePlaybackRate {
+                source_instance_id: SourceInstanceId::legacy(SourceId::Glicol),
+                rate: 2.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+
+        assert_eq!(runtime.dropped_source_instance_rt_commands(), 1);
+        assert_eq!(runtime.unsupported_source_instance_rt_commands(), 1);
     }
 
     #[test]
