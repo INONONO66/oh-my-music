@@ -1,7 +1,7 @@
 use std::f32::consts::TAU;
 
 use crate::dsp::SmoothedParam;
-use crate::frame::{StereoFrame, db_to_gain};
+use crate::frame::{db_to_gain, StereoFrame};
 use crate::source::AudioSource;
 
 const NOTES_HZ: [f32; 8] = [

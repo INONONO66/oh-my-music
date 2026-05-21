@@ -1,7 +1,7 @@
 use glicol::Engine;
 
 use crate::dsp::SmoothedParam;
-use crate::frame::{StereoFrame, db_to_gain};
+use crate::frame::{db_to_gain, StereoFrame};
 use crate::source::AudioSource;
 
 const GLICOL_BLOCK_SIZE: usize = 128;

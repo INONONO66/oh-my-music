@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ringbuf::HeapCons;
 use ringbuf::traits::Consumer;
+use ringbuf::HeapCons;
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 
 use crate::dsp::SmoothedParam;
-use crate::frame::{StereoFrame, db_to_gain};
+use crate::frame::{db_to_gain, StereoFrame};
 use crate::source::AudioSource;
 
 const INTERNAL_CHANNELS: usize = 2;

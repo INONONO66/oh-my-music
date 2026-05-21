@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -487,14 +487,12 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: ENGINE_SAMPLE_RATE,
         });
-        assert!(
-            runtime
-                .add_channel(
-                    SourceId::Glicol,
-                    Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
-                )
-                .is_ok()
-        );
+        assert!(runtime
+            .add_channel(
+                SourceId::Glicol,
+                Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
+            )
+            .is_ok());
 
         let mut frames = Vec::with_capacity(MAX_BLOCK_FRAMES);
         let bad_buffer_count = AtomicU64::new(0);
@@ -511,14 +509,12 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: ENGINE_SAMPLE_RATE,
         });
-        assert!(
-            runtime
-                .add_channel(
-                    SourceId::Glicol,
-                    Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
-                )
-                .is_ok()
-        );
+        assert!(runtime
+            .add_channel(
+                SourceId::Glicol,
+                Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
+            )
+            .is_ok());
 
         let mut frames = Vec::with_capacity(MAX_BLOCK_FRAMES);
         let initial_capacity = frames.capacity();
