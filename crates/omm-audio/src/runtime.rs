@@ -711,7 +711,12 @@ impl AudioRuntime {
         let channel = self
             .channel_by_instance_id_str_mut(&source_instance_id)
             .ok_or(SourceInstanceRtCommandError::NotFound)?;
-        channel.set_eq_gains_db(low_db, mid_db, high_db, ramp_frames);
+        channel.set_eq_gains_db(
+            finite_clamped_param(ParamId::EqLowGainDb, low_db, 0.0),
+            finite_clamped_param(ParamId::EqMidGainDb, mid_db, 0.0),
+            finite_clamped_param(ParamId::EqHighGainDb, high_db, 0.0),
+            ramp_frames,
+        );
         Ok(())
     }
 
@@ -724,7 +729,10 @@ impl AudioRuntime {
         let channel = self
             .channel_by_instance_id_str_mut(&source_instance_id)
             .ok_or(SourceInstanceRtCommandError::NotFound)?;
-        channel.set_reverb_send_db(send_db, ramp_frames);
+        channel.set_reverb_send_db(
+            finite_clamped_param(ParamId::ReverbSendDb, send_db, -60.0),
+            ramp_frames,
+        );
         Ok(())
     }
 
@@ -1555,6 +1563,54 @@ mod tests {
         assert_eq!(source.effects.eq.low_gain_db, 4.0);
         assert_eq!(source.effects.eq.mid_gain_db, -2.0);
         assert_eq!(source.effects.eq.high_gain_db, 3.0);
+    }
+
+    #[test]
+    fn rt_source_instance_eq_and_reverb_values_are_sanitized() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:rt-sanitized");
+        let bytes = sine_wav(2_000, 440.0);
+        runtime
+            .add_file_source_instance(file_request(
+                id.as_str(),
+                "mem://rt-sanitized.wav",
+                &bytes,
+                0,
+            ))
+            .expect("file source accepted");
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceEq {
+                source_instance_id: RtSourceInstanceId::new(id.as_str()),
+                low_db: f32::NAN,
+                mid_db: 99.0,
+                high_db: -99.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id: RtSourceInstanceId::new(id.as_str()),
+                send_db: f32::NAN,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("RT-sanitized source appears in snapshot");
+        assert_eq!(source.effects.eq.low_gain_db, 0.0);
+        assert_eq!(source.effects.eq.mid_gain_db, 12.0);
+        assert_eq!(source.effects.eq.high_gain_db, -12.0);
+        assert_eq!(source.effects.reverb_send_db, -60.0);
     }
 
     #[test]
