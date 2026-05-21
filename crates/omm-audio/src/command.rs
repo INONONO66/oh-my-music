@@ -1,11 +1,61 @@
-use omm_protocol::{params::SourceId, SourceInstanceId};
+use omm_protocol::params::SourceId;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 pub const RT_QUEUE_CAPACITY: usize = 1024;
 pub const MAX_DRAIN_PER_BLOCK: usize = 64;
+pub const RT_SOURCE_INSTANCE_ID_CAPACITY: usize = 128;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RtSourceInstanceId {
+    bytes: [u8; RT_SOURCE_INSTANCE_ID_CAPACITY],
+    len: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RtSourceInstanceIdError {
+    #[error("RT source instance id must not be empty")]
+    Empty,
+    #[error("RT source instance id exceeds {RT_SOURCE_INSTANCE_ID_CAPACITY} bytes")]
+    TooLong,
+    #[error("RT source instance id contains unsupported characters")]
+    InvalidCharacter,
+}
+
+impl RtSourceInstanceId {
+    pub fn new(value: &str) -> Self {
+        Self::try_new(value).expect("valid RT source instance id")
+    }
+
+    pub fn try_new(value: &str) -> Result<Self, RtSourceInstanceIdError> {
+        if value.is_empty() {
+            return Err(RtSourceInstanceIdError::Empty);
+        }
+        if value.len() > RT_SOURCE_INSTANCE_ID_CAPACITY {
+            return Err(RtSourceInstanceIdError::TooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.'))
+        {
+            return Err(RtSourceInstanceIdError::InvalidCharacter);
+        }
+
+        let mut bytes = [0_u8; RT_SOURCE_INSTANCE_ID_CAPACITY];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        Ok(Self {
+            bytes,
+            len: value.len() as u8,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize])
+            .expect("RT source instance id is always valid UTF-8")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RtCommand {
     SetMasterGainDb {
         db: f32,
@@ -44,42 +94,42 @@ pub enum RtCommand {
         enabled: bool,
     },
     SetSourceInstanceGainDb {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         db: f32,
         ramp_frames: u32,
     },
     SetSourceInstancePan {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         pan: f32,
         ramp_frames: u32,
     },
     SetSourceInstanceHighpassHz {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         hz: f32,
     },
     SetSourceInstanceLowpassHz {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         hz: f32,
     },
     SetSourceInstanceEq {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         low_db: f32,
         mid_db: f32,
         high_db: f32,
         ramp_frames: u32,
     },
     SetSourceInstanceReverbSendDb {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         send_db: f32,
         ramp_frames: u32,
     },
     SetSourceInstancePlaybackRate {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         rate: f32,
         ramp_frames: u32,
     },
     SetSourceInstanceReverse {
-        source_instance_id: SourceInstanceId,
+        source_instance_id: RtSourceInstanceId,
         reverse: bool,
     },
 }
@@ -130,6 +180,8 @@ impl CommandReceiver {
 mod tests {
     use super::*;
     use std::thread;
+
+    fn assert_copy<T: Copy>() {}
 
     fn command(index: u32) -> RtCommand {
         RtCommand::SetMasterGainDb {
@@ -256,6 +308,8 @@ mod tests {
 
     #[test]
     fn rt_command_defines_expected_variants() {
+        assert_copy::<RtCommand>();
+
         fn assert_variant_is_covered(command: RtCommand) {
             match command {
                 RtCommand::SetMasterGainDb { .. }
@@ -312,42 +366,42 @@ mod tests {
                 enabled: true,
             },
             RtCommand::SetSourceInstanceGainDb {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 db: -6.0,
                 ramp_frames: 4800,
             },
             RtCommand::SetSourceInstancePan {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 pan: 0.25,
                 ramp_frames: 4800,
             },
             RtCommand::SetSourceInstanceHighpassHz {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 hz: 80.0,
             },
             RtCommand::SetSourceInstanceLowpassHz {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 hz: 12_000.0,
             },
             RtCommand::SetSourceInstanceEq {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 low_db: 3.0,
                 mid_db: -2.0,
                 high_db: 1.0,
                 ramp_frames: 4800,
             },
             RtCommand::SetSourceInstanceReverbSendDb {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 send_db: -12.0,
                 ramp_frames: 4800,
             },
             RtCommand::SetSourceInstancePlaybackRate {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 rate: 1.5,
                 ramp_frames: 4800,
             },
             RtCommand::SetSourceInstanceReverse {
-                source_instance_id: SourceInstanceId::new("file:loop"),
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 reverse: true,
             },
         ];
@@ -355,5 +409,17 @@ mod tests {
         for command in commands {
             assert_variant_is_covered(command);
         }
+    }
+
+    #[test]
+    fn rt_source_instance_id_is_fixed_capacity() {
+        let id = RtSourceInstanceId::new("file:loop-01");
+
+        assert_eq!(id.as_str(), "file:loop-01");
+        assert!(RtSourceInstanceId::try_new("").is_err());
+        assert!(RtSourceInstanceId::try_new("file/loop").is_err());
+        assert!(
+            RtSourceInstanceId::try_new(&"x".repeat(RT_SOURCE_INSTANCE_ID_CAPACITY + 1)).is_err()
+        );
     }
 }
