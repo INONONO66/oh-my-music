@@ -41,9 +41,11 @@ pub enum PlayerSourceError {
 
 pub struct PlayerSource {
     frames: Vec<StereoFrame>,
-    position: usize,
+    position: f64,
     enabled: bool,
     gain_db: SmoothedParam,
+    playback_rate: SmoothedParam,
+    reverse: bool,
 }
 
 impl PlayerSource {
@@ -62,9 +64,11 @@ impl PlayerSource {
 
         Ok(Self {
             frames,
-            position: 0,
+            position: 0.0,
             enabled: true,
             gain_db: SmoothedParam::new(0.0),
+            playback_rate: SmoothedParam::new(1.0),
+            reverse: false,
         })
     }
 
@@ -73,24 +77,79 @@ impl PlayerSource {
     }
 
     pub fn position_frames(&self) -> usize {
-        self.position
+        self.clamped_position_frames()
     }
 
     pub fn is_finished(&self) -> bool {
-        self.position >= self.frames.len()
+        if self.reverse {
+            self.position < 0.0
+        } else {
+            self.position >= self.frames.len() as f64
+        }
     }
 
     pub fn restart(&mut self) {
-        self.position = 0;
+        self.position = 0.0;
     }
 
     pub fn seek_frames(&mut self, frame: u64) {
-        self.position = (frame as usize).min(self.frames.len());
+        self.position = (frame as usize).min(self.frames.len()) as f64;
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f32, ramp_frames: u32) {
+        let rate = if rate.is_finite() {
+            rate.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+        self.playback_rate.set_target(rate, ramp_frames);
+    }
+
+    pub fn playback_rate(&self) -> f32 {
+        self.playback_rate.current()
+    }
+
+    pub fn set_reverse(&mut self, reverse: bool) {
+        if self.reverse != reverse
+            && reverse
+            && (self.position <= 0.0 || self.position >= self.frames.len() as f64)
+        {
+            self.position = self.frames.len().saturating_sub(1) as f64;
+        }
+        self.reverse = reverse;
+    }
+
+    pub fn reverse(&self) -> bool {
+        self.reverse
     }
 
     fn apply_gain(&mut self, frame: StereoFrame) -> StereoFrame {
         let gain = db_to_gain(self.gain_db.next_value());
         StereoFrame::new(frame.left * gain, frame.right * gain)
+    }
+
+    fn clamped_position_frames(&self) -> usize {
+        if self.position <= 0.0 {
+            0
+        } else {
+            (self.position.floor() as usize).min(self.frames.len())
+        }
+    }
+
+    fn frame_at_position(&self, position: f64) -> Option<StereoFrame> {
+        if !(0.0..self.frames.len() as f64).contains(&position) {
+            return None;
+        }
+
+        let index = position.floor() as usize;
+        let next_index = (index + 1).min(self.frames.len() - 1);
+        let frac = (position - index as f64) as f32;
+        let current = self.frames[index];
+        let next = self.frames[next_index];
+        Some(StereoFrame::new(
+            current.left + (next.left - current.left) * frac,
+            current.right + (next.right - current.right) * frac,
+        ))
     }
 }
 
@@ -105,18 +164,30 @@ impl AudioSource for PlayerSource {
             return;
         }
 
-        let remaining = self.frames.len().saturating_sub(self.position);
-        let frames_to_copy = remaining.min(output.len());
-
-        for (frame_index, output_frame) in output.iter_mut().take(frames_to_copy).enumerate() {
-            let frame = self.frames[self.position + frame_index];
+        let mut rendered = 0;
+        for output_frame in output.iter_mut() {
+            let Some(frame) = self.frame_at_position(self.position) else {
+                break;
+            };
             *output_frame = self.apply_gain(frame);
+            let rate = {
+                let next = self.playback_rate.next_value();
+                if next.is_finite() {
+                    next.clamp(0.25, 4.0)
+                } else {
+                    1.0
+                }
+            } as f64;
+            if self.reverse {
+                self.position -= rate;
+            } else {
+                self.position += rate;
+            }
+            rendered += 1;
         }
 
-        self.position += frames_to_copy;
-
-        if frames_to_copy < output.len() {
-            output[frames_to_copy..].fill(StereoFrame::SILENCE);
+        if rendered < output.len() {
+            output[rendered..].fill(StereoFrame::SILENCE);
         }
     }
 
@@ -129,7 +200,7 @@ impl AudioSource for PlayerSource {
     }
 
     fn position_frames(&self) -> Option<u64> {
-        Some(self.position as u64)
+        Some(self.clamped_position_frames() as u64)
     }
 
     fn duration_frames(&self) -> Option<u64> {
@@ -143,6 +214,24 @@ impl AudioSource for PlayerSource {
 
     fn is_finished(&self) -> bool {
         PlayerSource::is_finished(self)
+    }
+
+    fn set_playback_rate(&mut self, rate: f32, ramp_frames: u32) -> bool {
+        PlayerSource::set_playback_rate(self, rate, ramp_frames);
+        true
+    }
+
+    fn playback_rate(&self) -> Option<f32> {
+        Some(PlayerSource::playback_rate(self))
+    }
+
+    fn set_reverse(&mut self, reverse: bool) -> bool {
+        PlayerSource::set_reverse(self, reverse);
+        true
+    }
+
+    fn reverse(&self) -> Option<bool> {
+        Some(PlayerSource::reverse(self))
     }
 }
 

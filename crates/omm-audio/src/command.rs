@@ -1,11 +1,11 @@
-use omm_protocol::params::SourceId;
+use omm_protocol::{params::SourceId, SourceInstanceId};
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 pub const RT_QUEUE_CAPACITY: usize = 1024;
 pub const MAX_DRAIN_PER_BLOCK: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RtCommand {
     SetMasterGainDb {
         db: f32,
@@ -42,6 +42,45 @@ pub enum RtCommand {
     SetChannelEnabled {
         source_id: SourceId,
         enabled: bool,
+    },
+    SetSourceInstanceGainDb {
+        source_instance_id: SourceInstanceId,
+        db: f32,
+        ramp_frames: u32,
+    },
+    SetSourceInstancePan {
+        source_instance_id: SourceInstanceId,
+        pan: f32,
+        ramp_frames: u32,
+    },
+    SetSourceInstanceHighpassHz {
+        source_instance_id: SourceInstanceId,
+        hz: f32,
+    },
+    SetSourceInstanceLowpassHz {
+        source_instance_id: SourceInstanceId,
+        hz: f32,
+    },
+    SetSourceInstanceEq {
+        source_instance_id: SourceInstanceId,
+        low_db: f32,
+        mid_db: f32,
+        high_db: f32,
+        ramp_frames: u32,
+    },
+    SetSourceInstanceReverbSendDb {
+        source_instance_id: SourceInstanceId,
+        send_db: f32,
+        ramp_frames: u32,
+    },
+    SetSourceInstancePlaybackRate {
+        source_instance_id: SourceInstanceId,
+        rate: f32,
+        ramp_frames: u32,
+    },
+    SetSourceInstanceReverse {
+        source_instance_id: SourceInstanceId,
+        reverse: bool,
     },
 }
 
@@ -250,8 +289,47 @@ mod tests {
                 source_id: SourceId::System,
                 enabled: true,
             },
+            RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                db: -6.0,
+                ramp_frames: 4800,
+            },
+            RtCommand::SetSourceInstancePan {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                pan: 0.25,
+                ramp_frames: 4800,
+            },
+            RtCommand::SetSourceInstanceHighpassHz {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                hz: 80.0,
+            },
+            RtCommand::SetSourceInstanceLowpassHz {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                hz: 12_000.0,
+            },
+            RtCommand::SetSourceInstanceEq {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                low_db: 3.0,
+                mid_db: -2.0,
+                high_db: 1.0,
+                ramp_frames: 4800,
+            },
+            RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                send_db: -12.0,
+                ramp_frames: 4800,
+            },
+            RtCommand::SetSourceInstancePlaybackRate {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                rate: 1.5,
+                ramp_frames: 4800,
+            },
+            RtCommand::SetSourceInstanceReverse {
+                source_instance_id: SourceInstanceId::new("file:loop"),
+                reverse: true,
+            },
         ];
 
-        assert_eq!(commands.len(), 9);
+        assert_eq!(commands.len(), 17);
     }
 }

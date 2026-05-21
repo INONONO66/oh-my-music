@@ -82,7 +82,7 @@ SourceId::Player channel
   → SourceTimelineSnapshot
 ```
 
-The current implementation establishes the schema, fixed-channel bridge, and runtime-owned file source instances as a staged library primitive. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`; dynamic file instances reserve the `legacy:` instance-id namespace for fixed-channel bridges and report `PlaybackStatusAuthority::TimelineTransport`, URI/duration asset metadata, source offsets, playback position, and current gain/pan/filter status. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. The timeline placement currently records immutable placement intent; consumers must use `playback.state` as the runtime liveness authority for stopped or ended sources. Later implementation stages attach generated layer allocation, richer source transport, RT-safe prepared-source handoff, asset/instance deduplication, lifecycle cleanup, and per-source effect automation to these source instances through validated handlers/adapters.
+The current implementation establishes the schema, fixed-channel bridge, runtime-owned file source instances, and per-source effect automation primitives. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`; dynamic file instances reserve the `legacy:` instance-id namespace for fixed-channel bridges and report `PlaybackStatusAuthority::TimelineTransport`, URI/duration asset metadata, source offsets, playback position, and current gain/pan/filter/EQ/reverb/rate/reverse status. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. The timeline placement currently records immutable placement intent; consumers must use `playback.state` as the runtime liveness authority for stopped or ended sources. Later implementation stages attach generated layer allocation, richer source transport, RT-safe prepared-source handoff, asset/instance deduplication, and lifecycle cleanup to these source instances through validated handlers/adapters.
 
 ### Source 특성
 
@@ -414,17 +414,16 @@ Core Audio Process Tap
 **Per Source:**
 ```
 Input
-  → DC Blocker
-  → High-pass Filter
-  → Noise Gate (마이크만)
-  → Gain Trim
+  → Source transport (offset, playback-rate, reverse for file sources)
+  → Gain Trim / source fade
+  → Pan
   → 3-Band EQ (Low/Mid/High)
-  → Compressor
-  → Saturation
-  → Pan / Stereo Width
-  → FX Sends (Reverb, Delay)
-  → Source Fader
+  → High-pass Filter
+  → Low-pass Filter
+  → Source-local Reverb send/return
   → Bus
+
+Implemented today: gain/fade/pan, three-band EQ, HPF/LPF, source-local pragmatic reverb send, playback-rate, reverse, and linear ramp automation. Compressor, saturation, delay, stereo width, and richer FX returns remain planned.
 ```
 
 **FX Returns:**
@@ -470,7 +469,7 @@ Bus Sum
 **Spatial:**
 | Effect | Parameters | Range | Default |
 |--------|-----------|-------|---------|
-| Reverb (Plate) | `size`, `decay_sec`, `damping`, `pre_delay_ms`, `send_db` | 0..1, 0.2..10, 0..1, 0..200, -60..0 | 0.4, 2.0, 0.5, 20, -inf |
+| Reverb (source-local pragmatic) | `send_db` | -60..0 | -60 |
 | Delay | `time_ms`, `feedback`, `send_db` | 20..2000, 0..0.85, -60..0 | 375, 0.25, -inf |
 
 **Dynamics:**
@@ -508,7 +507,6 @@ Bus Sum
 
 | Effect | 설명 |
 |--------|------|
-| Reverse | 거꾸로 재생 |
 | Tape Stop | 느려지면서 피치 다운 |
 | Ping-pong Delay | 좌→우 에코 |
 | Waveshaper | 파형 변형 |
@@ -520,7 +518,7 @@ Bus Sum
 
 ### 6.3 Parameter Smoothing
 
-모든 외부 제어 파라미터는 스무딩을 거친다:
+외부 제어 파라미터는 스무딩/자동화 ramp를 거친다. Current implementation uses linear per-frame ramps for gain, pan, EQ band gains, reverb send, and playback rate; reverse is an immediate boolean transport switch.
 
 ```rust
 pub struct SmoothedParam {

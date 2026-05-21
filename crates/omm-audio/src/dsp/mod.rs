@@ -1,3 +1,4 @@
+pub mod effects;
 pub mod filters;
 pub mod gain;
 pub mod limiter;
@@ -5,6 +6,7 @@ pub mod pan;
 pub mod safety;
 pub mod smoothing;
 
+pub use effects::{SimpleReverb, ThreeBandEq};
 pub use filters::{OnePoleHighpass, OnePoleLowpass};
 pub use gain::apply_gain_block;
 pub use limiter::SafetyLimiter;

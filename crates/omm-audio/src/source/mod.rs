@@ -36,4 +36,20 @@ pub trait AudioSource: Send {
     fn is_finished(&self) -> bool {
         false
     }
+
+    fn set_playback_rate(&mut self, _rate: f32, _ramp_frames: u32) -> bool {
+        false
+    }
+
+    fn playback_rate(&self) -> Option<f32> {
+        None
+    }
+
+    fn set_reverse(&mut self, _reverse: bool) -> bool {
+        false
+    }
+
+    fn reverse(&self) -> Option<bool> {
+        None
+    }
 }
