@@ -374,7 +374,7 @@ The engine distinguishes **planned** LLM/Pi timeline actions from **immediate** 
 - `ScheduledActionId` is stable for cancellation/modification.
 - Scheduler cancellation, trigger modification, duplicate id, and not-found errors are explicit.
 - The runtime drains due scheduled RT commands at render-block boundaries using `rendered_frames` as engine time.
-- Immediate and due scheduled RT commands share one render-block command budget. Immediate queue commands drain first as the manual/emergency safety override lane; due scheduled commands consume any remaining budget, so saturated immediate traffic can defer planned actions to the next render block.
+- Immediate and due scheduled RT commands share one render-block command budget. Immediate queue commands drain first as the manual/emergency safety override lane; due scheduled commands consume any remaining budget, so sustained immediate traffic can defer planned actions to one or more subsequent render blocks depending on budget availability.
 - Render-block draining advances a trigger-time frontier instead of scanning all scheduled actions or collecting a heap `Vec` of due commands on the callback path.
 - Schedule/cancel/modify/reclaim APIs are non-render/control-side operations. IPC or tool adapters must hand off scheduler mutations without locking the callback-owned `AudioRuntime`; dispatched metadata is reclaimed by explicit non-render maintenance or later scheduler mutations.
 
