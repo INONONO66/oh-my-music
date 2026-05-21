@@ -110,11 +110,12 @@ impl PlayerSource {
     }
 
     pub fn set_reverse(&mut self, reverse: bool) {
-        if self.reverse != reverse
-            && reverse
-            && (self.position <= 0.0 || self.position >= self.frames.len() as f64)
-        {
-            self.position = self.frames.len().saturating_sub(1) as f64;
+        if self.reverse != reverse {
+            if reverse && (self.position <= 0.0 || self.position >= self.frames.len() as f64) {
+                self.position = self.frames.len().saturating_sub(1) as f64;
+            } else if !reverse && self.position < 0.0 {
+                self.position = 0.0;
+            }
         }
         self.reverse = reverse;
     }
@@ -687,6 +688,32 @@ mod tests {
             assert_near(frame.left, 0.0);
             assert_near(frame.right, 0.0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn switching_reverse_off_after_reverse_finish_resumes_forward_from_start(
+    ) -> Result<(), PlayerSourceError> {
+        let bytes = stereo_wav(48_000, 16, 440.0);
+        let mut source = PlayerSource::from_bytes(&bytes, 48_000)?;
+
+        source.set_reverse(true);
+        let reverse_output = render(&mut source, 20);
+        assert!(source.is_finished());
+        assert!(reverse_output
+            .iter()
+            .take(16)
+            .any(|frame| frame.left.abs() > 0.0));
+
+        source.set_reverse(false);
+        assert_eq!(source.position_frames(), 0);
+        assert!(!source.is_finished());
+        let forward_output = render(&mut source, 4);
+
+        assert!(
+            forward_output.iter().any(|frame| frame.left.abs() > 0.0),
+            "forward playback should resume after toggling reverse off"
+        );
         Ok(())
     }
 
