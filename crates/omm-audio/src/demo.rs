@@ -7,7 +7,7 @@ use omm_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AudioRuntime, AudioRuntimeConfig, FileSourceInstanceRequest, RtCommand,
+    AudioRuntime, AudioRuntimeConfig, FileSourceInstanceRequest, QueueFull, RtCommand,
     RtCommandScheduleRequest, RtCommandSchedulerError, RtSourceInstanceId, SourceInstanceError,
     StereoFrame,
 };
@@ -76,6 +76,8 @@ pub enum TimelineDjDemoError {
     Source(#[from] SourceInstanceError),
     #[error("planned action scheduling failed: {0}")]
     Schedule(#[from] RtCommandSchedulerError),
+    #[error("immediate demo command queue was full: {0}")]
+    QueueFull(#[from] QueueFull),
     #[error("timeline DJ demo requires a non-zero sample rate")]
     InvalidSampleRate,
     #[error("timeline DJ demo requires a non-zero block size")]
@@ -130,7 +132,7 @@ pub fn run_timeline_dj_demo(
         .filter(|source| source.playback.state == PlaybackState::Playing)
         .count();
 
-    enqueue_immediate_controls(&mut queue);
+    enqueue_immediate_controls(&mut queue)?;
 
     let too_soon = runtime.schedule_rt_command(RtCommandScheduleRequest {
         action_id: ScheduledActionId::new("demo-too-soon"),
@@ -146,12 +148,13 @@ pub fn run_timeline_dj_demo(
             ramp_frames: 0,
         },
     });
-    let planned_too_soon_rejected = matches!(
-        too_soon,
+    let planned_too_soon_rejected = match too_soon {
         Err(RtCommandSchedulerError::Validation(
-            ScheduleValidationError::PlannedActionTooSoon { .. }
-        ))
-    );
+            ScheduleValidationError::PlannedActionTooSoon { .. },
+        )) => true,
+        Ok(_) => false,
+        Err(error) => return Err(TimelineDjDemoError::Schedule(error)),
+    };
 
     let planned_trigger_frame =
         submitted_at_frame + frames_for_duration_ms(config.planned_delay_ms, config.sample_rate);
@@ -222,7 +225,7 @@ pub fn run_timeline_dj_demo(
     })
 }
 
-fn enqueue_immediate_controls(queue: &mut crate::CommandQueue) {
+fn enqueue_immediate_controls(queue: &mut crate::CommandQueue) -> Result<(), TimelineDjDemoError> {
     let deck_a = RtSourceInstanceId::new(DECK_A_ID);
     let deck_b = RtSourceInstanceId::new(DECK_B_ID);
     let commands = [
@@ -273,10 +276,10 @@ fn enqueue_immediate_controls(queue: &mut crate::CommandQueue) {
     ];
 
     for command in commands {
-        queue
-            .enqueue(command)
-            .expect("demo command queue has enough capacity");
+        queue.enqueue(command)?;
     }
+
+    Ok(())
 }
 
 fn file_request(
