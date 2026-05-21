@@ -82,7 +82,7 @@ SourceId::Player channel
   → SourceTimelineSnapshot
 ```
 
-PR2 establishes the schema and fixed-channel bridge only. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`, not as future scheduler transport authority. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. Later PRs attach planned scheduling, dynamic file/generated layer allocation, source playback controls, and per-source effect automation to these source instances through validated handlers/adapters.
+The current implementation establishes the schema and fixed-channel bridge only. The bridge reports existing channel enablement with `PlaybackStatusAuthority::LegacyChannelEnabled`, not as future scheduler transport authority. `AudioRuntime::source_timeline_snapshot()` is a non-real-time status adapter and must not run inside the render callback. Later implementation stages attach planned scheduling, dynamic file/generated layer allocation, source playback controls, and per-source effect automation to these source instances through validated handlers/adapters.
 
 ### Source 특성
 
@@ -364,7 +364,31 @@ const MAX_COMMANDS_PER_BLOCK: usize = 64;
 
 현재 Audio Understanding 경계는 분석/증거 표현까지다. 출력은 DJ action recommendation, transition choice, generated-code sketch hint를 포함하지 않는다.
 
-### 5.7 Core Audio Tap
+
+### 5.7 Planned Action Scheduler Semantics
+
+The engine distinguishes **planned** LLM/Pi timeline actions from **immediate** manual/test/emergency controls. Planned actions are validated against engine frame time, not wall-clock time.
+
+- `ActionOrigin::PlannedLlm` and `ActionOrigin::PlannedPi` require `trigger_frame >= submitted_at_frame + 30_000ms`.
+- `ActionOrigin::Manual`, `ActionOrigin::Test`, and `ActionOrigin::Emergency` may execute at the current engine frame.
+- `ScheduledActionId` is stable for cancellation/modification.
+- Scheduler cancellation, trigger modification, duplicate id, and not-found errors are explicit.
+- The runtime drains due scheduled RT commands at render-block boundaries using `rendered_frames` as engine time.
+- Immediate and due scheduled RT commands share one render-block command budget. Immediate queue commands drain first as the manual/emergency safety override lane; due scheduled commands consume any remaining budget, so sustained immediate traffic can defer planned actions to one or more subsequent render blocks depending on budget availability.
+- Render-block draining advances a trigger-time frontier instead of scanning all scheduled actions or collecting a heap `Vec` of due commands on the callback path.
+- Schedule/cancel/modify/reclaim APIs are non-render/control-side operations. IPC or tool adapters must hand off scheduler mutations without locking the callback-owned `AudioRuntime`; dispatched metadata is reclaimed by explicit non-render maintenance or later scheduler mutations.
+
+```text
+controller request
+  → ActionOrigin + ScheduledActionId + trigger_frame
+  → validate_schedule_request(engine_frame, sample_rate)
+  → RtCommandScheduler
+  → due commands applied from engine time during render-block boundaries
+```
+
+This layer establishes scheduler semantics for RT commands. Later implementation stages attach timeline source creation/playback/effect operations to the same planned/immediate rules.
+
+### 5.8 Core Audio Tap
 
 ```
 Core Audio Process Tap
@@ -688,7 +712,7 @@ type Envelope<T> = {
 
 ### 8.3 Agent → Engine Messages
 
-The table below separates implemented protocol rows from planned contract direction. PR2 adds dynamic source timeline schema/event types and a fixed-channel bridge; runtime scheduling/command handlers remain planned for later PRs.
+The table below separates implemented protocol rows from planned contract direction. The protocol includes dynamic source timeline schema/event types, a fixed-channel bridge, and planned/immediate scheduler semantics for RT commands; timeline source command handlers remain planned.
 
 | Kind | Purpose | Status |
 |------|---------|--------|
@@ -717,7 +741,7 @@ The table below separates implemented protocol rows from planned contract direct
 | `Nack` | 명령 거부 (코드 + 사유) | implemented |
 | `StateSnapshot` | 전체 엔진 상태 덤프 | implemented |
 | `MeterFrame` | RMS/peak/gain reduction (10-15 FPS) | implemented |
-| `ChannelFeatures` / future `AnalysisPcmChunk` | 현재 Rust feature snapshot 또는 향후 PCM 분석 청크 (PR1은 아직 IPC 이벤트를 추가하지 않고 오디오 이해 스키마/오프라인 분석 기반만 정의) | planned |
+| `ChannelFeatures` / future `AnalysisPcmChunk` | 현재 Rust feature snapshot 또는 향후 PCM 분석 청크 (현재 오디오 이해 구현은 IPC 이벤트 없이 스키마/오프라인 분석 기반만 정의) | planned |
 | `DiscordPcmFrame` | Discord 출력 프레임 (20ms, 3840 bytes) | planned |
 | `CaptureStatus` | 캡처 상태 변경 알림 | implemented |
 | `SourceTimelineSnapshot` | dynamic source instances with active windows/playback/effect status | schema implemented / emission planned |
@@ -871,7 +895,7 @@ RawFeatureTimeline
        └─ component estimates linked to evidence
 ```
 
-Required boundary: the semantic object explains audio content and evolution only. It must not include DJ action recommendations, generated-code sketch hints, “best transition” choices, or unsupported subjective claims. Beat/downbeat/bar/phrase markers in PR1 are projected from the estimated beat interval; they are not yet structural downbeat/bar/phrase detections.
+Required boundary: the semantic object explains audio content and evolution only. It must not include DJ action recommendations, generated-code sketch hints, “best transition” choices, or unsupported subjective claims. Beat/downbeat/bar/phrase markers are projected from the estimated beat interval; they are not yet structural downbeat/bar/phrase detections.
 
 Future richer analysis may add a PCM chunk router and JS/WASM processors:
 
