@@ -1,3 +1,4 @@
+use crate::channel::file_timeline;
 use crate::command::{
     new_command_channel, CommandQueue, CommandReceiver, RtCommand, MAX_DRAIN_PER_BLOCK,
 };
@@ -9,12 +10,15 @@ use crate::features::analyzer::{analysis_ringbuf_capacity, FeatureRegistry};
 use crate::frame::StereoFrame;
 use crate::meter::MeterSnapshot;
 use crate::mixer::Mixer;
-use crate::source::AudioSource;
+use crate::source::{AudioSource, PlayerSource, PlayerSourceError};
 use crate::{
     ChannelStrip, FeatureAnalyzerHandle, RtCommandScheduleRequest, RtCommandScheduler,
     RtCommandSchedulerError,
 };
-use omm_protocol::{SourceId, SourceTimelineSnapshot};
+use omm_protocol::{
+    frames_for_duration_ms, SourceAssetRef, SourceId, SourceInstanceId, SourceKind,
+    SourceTimelineSnapshot, SourceTimelineValidationError,
+};
 use ringbuf::traits::Split;
 use ringbuf::HeapRb;
 
@@ -22,6 +26,37 @@ use ringbuf::HeapRb;
 pub enum ChannelError {
     #[error("duplicate source id: {source_id:?}")]
     DuplicateSourceId { source_id: SourceId },
+}
+
+#[derive(Debug)]
+pub struct FileSourceInstanceRequest {
+    pub source_instance_id: SourceInstanceId,
+    pub uri: String,
+    pub bytes: Vec<u8>,
+    pub start_offset_ms: u64,
+    pub gain_db: f32,
+    pub pan: f32,
+    pub highpass_hz: f32,
+    pub lowpass_hz: f32,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SourceInstanceError {
+    #[error(transparent)]
+    Validation(#[from] SourceTimelineValidationError),
+    #[error("source instance already exists: {source_instance_id}")]
+    DuplicateSourceInstance { source_instance_id: String },
+    #[error("source instance id is reserved for fixed legacy channels: {source_instance_id}")]
+    ReservedSourceInstanceId { source_instance_id: String },
+    #[error("start offset {start_offset_ms} ms is not before file duration {duration_ms} ms")]
+    StartOffsetBeyondDuration {
+        start_offset_ms: u64,
+        duration_ms: u64,
+    },
+    #[error(transparent)]
+    Player(#[from] PlayerSourceError),
+    #[error("source instance not found: {source_instance_id}")]
+    SourceInstanceNotFound { source_instance_id: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +115,7 @@ impl AudioRuntime {
         if self
             .channels
             .iter()
-            .any(|channel| channel.source_id() == source_id)
+            .any(|channel| channel.legacy_source_id() == Some(source_id))
         {
             return Err(ChannelError::DuplicateSourceId { source_id });
         }
@@ -91,6 +126,132 @@ impl AudioRuntime {
         strip.attach_analysis_producer(producer);
         self.feature_registry.register_channel(source_id, consumer);
         self.channels.push(strip);
+        Ok(())
+    }
+
+    pub fn add_file_source_instance(
+        &mut self,
+        request: FileSourceInstanceRequest,
+    ) -> Result<(), SourceInstanceError> {
+        request.source_instance_id.validate()?;
+        let source_instance_id = request.source_instance_id.as_str();
+        if source_instance_id.starts_with("legacy:") {
+            return Err(SourceInstanceError::ReservedSourceInstanceId {
+                source_instance_id: source_instance_id.to_string(),
+            });
+        }
+        if self
+            .channels
+            .iter()
+            .any(|channel| channel.source_instance_id() == &request.source_instance_id)
+        {
+            return Err(SourceInstanceError::DuplicateSourceInstance {
+                source_instance_id: source_instance_id.to_string(),
+            });
+        }
+
+        let mut source = PlayerSource::from_bytes(&request.bytes, self.sample_rate)?;
+        let duration_frames = source.duration_frames() as u64;
+        let duration_ms = frames_to_ms(duration_frames, self.sample_rate);
+        let start_offset_frames = frames_for_duration_ms(request.start_offset_ms, self.sample_rate);
+        if start_offset_frames >= duration_frames {
+            return Err(SourceInstanceError::StartOffsetBeyondDuration {
+                start_offset_ms: request.start_offset_ms,
+                duration_ms,
+            });
+        }
+        source.seek_frames(start_offset_frames);
+
+        let timeline_start_ms = frames_to_ms(self.rendered_frames, self.sample_rate);
+        let mut strip = ChannelStrip::new_timeline_source(
+            request.source_instance_id,
+            SourceKind::File,
+            Some(SourceAssetRef::File {
+                uri: request.uri,
+                content_hash: None,
+                duration_ms: Some(duration_ms),
+            }),
+            file_timeline(timeline_start_ms, request.start_offset_ms),
+            Box::new(source),
+            self.sample_rate,
+        );
+        strip.set_gain_db(request.gain_db, 0);
+        strip.set_pan(request.pan, 0);
+        strip.set_highpass_hz(request.highpass_hz);
+        strip.set_lowpass_hz(request.lowpass_hz);
+        self.channels.push(strip);
+        Ok(())
+    }
+
+    pub fn stop_source_instance(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        fade_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.stop(fade_frames);
+        Ok(())
+    }
+
+    pub fn set_source_instance_gain_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_gain_db(db, ramp_frames);
+        Ok(())
+    }
+
+    pub fn set_source_instance_pan(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        pan: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_pan(pan, ramp_frames);
+        Ok(())
+    }
+
+    pub fn set_source_instance_highpass_hz(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        hz: f32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_highpass_hz(hz);
+        Ok(())
+    }
+
+    pub fn set_source_instance_lowpass_hz(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        hz: f32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_lowpass_hz(hz);
         Ok(())
     }
 
@@ -178,7 +339,9 @@ impl AudioRuntime {
             sources: self
                 .channels
                 .iter()
-                .map(ChannelStrip::timeline_source_snapshot)
+                .map(|channel| {
+                    channel.timeline_source_snapshot(self.rendered_frames, self.sample_rate)
+                })
                 .collect(),
         }
     }
@@ -203,7 +366,7 @@ impl AudioRuntime {
         if let Some(channel) = self
             .channels
             .iter_mut()
-            .find(|ch| ch.source_id() == source_id)
+            .find(|ch| ch.legacy_source_id() == Some(source_id))
         {
             channel.set_gain_db(db, ramp_frames);
         }
@@ -213,7 +376,7 @@ impl AudioRuntime {
         if let Some(channel) = self
             .channels
             .iter_mut()
-            .find(|ch| ch.source_id() == source_id)
+            .find(|ch| ch.legacy_source_id() == Some(source_id))
         {
             channel.set_pan(pan, ramp_frames);
         }
@@ -223,7 +386,7 @@ impl AudioRuntime {
         if let Some(channel) = self
             .channels
             .iter_mut()
-            .find(|ch| ch.source_id() == source_id)
+            .find(|ch| ch.legacy_source_id() == Some(source_id))
         {
             channel.set_highpass_hz(hz);
         }
@@ -233,7 +396,7 @@ impl AudioRuntime {
         if let Some(channel) = self
             .channels
             .iter_mut()
-            .find(|ch| ch.source_id() == source_id)
+            .find(|ch| ch.legacy_source_id() == Some(source_id))
         {
             channel.set_lowpass_hz(hz);
         }
@@ -243,10 +406,19 @@ impl AudioRuntime {
         if let Some(channel) = self
             .channels
             .iter_mut()
-            .find(|ch| ch.source_id() == source_id)
+            .find(|ch| ch.legacy_source_id() == Some(source_id))
         {
             channel.set_enabled(enabled);
         }
+    }
+
+    fn channel_by_instance_id_mut(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+    ) -> Option<&mut ChannelStrip> {
+        self.channels
+            .iter_mut()
+            .find(|channel| channel.source_instance_id() == source_instance_id)
     }
 
     fn drain_commands(&mut self, max: usize) -> usize {
@@ -328,13 +500,21 @@ impl AudioRuntime {
     }
 }
 
+fn frames_to_ms(frames: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    ((frames as u128 * 1_000) / sample_rate as u128) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::features::ChannelFeatures;
     use crate::source::{GlicolSource, TestToneSource};
     use omm_protocol::{
-        ActionOrigin, EngineTime, PlaybackState, ScheduledActionId, SourceId, SourceKind,
+        ActionOrigin, EngineTime, PlaybackState, ScheduledActionId, SourceAssetRef, SourceId,
+        SourceKind,
     };
 
     const SAMPLE_RATE: u32 = 48_000;
@@ -399,6 +579,69 @@ mod tests {
         assert!(result.is_ok(), "channel should be added: {result:?}");
     }
 
+    fn file_request(
+        id: &str,
+        uri: &str,
+        bytes: &[u8],
+        start_offset_ms: u64,
+    ) -> FileSourceInstanceRequest {
+        FileSourceInstanceRequest {
+            source_instance_id: SourceInstanceId::new(id),
+            uri: uri.to_string(),
+            bytes: bytes.to_vec(),
+            start_offset_ms,
+            gain_db: 0.0,
+            pan: 0.0,
+            highpass_hz: 20.0,
+            lowpass_hz: 20_000.0,
+        }
+    }
+
+    fn mono_wav(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
+        let bytes_per_sample = 2_u16;
+        let data_len = (samples.len() * bytes_per_sample as usize) as u32;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * bytes_per_sample as u32).to_le_bytes());
+        bytes.extend_from_slice(&bytes_per_sample.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        bytes
+    }
+
+    fn stepped_wav() -> Vec<u8> {
+        let mut samples = vec![0_i16; SAMPLE_RATE as usize / 2];
+        for (index, sample) in samples.iter_mut().enumerate().skip(4_800) {
+            let phase = std::f32::consts::TAU * 440.0 * index as f32 / SAMPLE_RATE as f32;
+            *sample = (phase.sin() * i16::MAX as f32 * 0.5) as i16;
+        }
+        mono_wav(SAMPLE_RATE, &samples)
+    }
+
+    fn sine_wav(frames: usize, freq_hz: f32) -> Vec<u8> {
+        let samples: Vec<i16> = (0..frames)
+            .map(|index| {
+                let phase = std::f32::consts::TAU * freq_hz * index as f32 / SAMPLE_RATE as f32;
+                (phase.sin() * i16::MAX as f32 * 0.5) as i16
+            })
+            .collect();
+        mono_wav(SAMPLE_RATE, &samples)
+    }
+
     fn runtime_with_loud_channels(source_ids: &[SourceId], value: f32) -> AudioRuntime {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
@@ -434,6 +677,201 @@ mod tests {
             Err(ChannelError::DuplicateSourceId {
                 source_id: SourceId::System
             })
+        );
+    }
+
+    #[test]
+    fn multiple_file_instances_can_share_the_same_asset_with_offsets() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let bytes = stepped_wav();
+        let first_id = SourceInstanceId::new("file:loop-a");
+        let second_id = SourceInstanceId::new("file:loop-b");
+
+        runtime
+            .add_file_source_instance(file_request(first_id.as_str(), "mem://same.wav", &bytes, 0))
+            .expect("first file instance accepted");
+        runtime
+            .add_file_source_instance(file_request(
+                second_id.as_str(),
+                "mem://same.wav",
+                &bytes,
+                100,
+            ))
+            .expect("second file instance accepted with same asset");
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let file_sources: Vec<_> = snapshot
+            .sources
+            .iter()
+            .filter(|source| source.source_kind == SourceKind::File)
+            .collect();
+        assert_eq!(file_sources.len(), 2);
+        assert!(file_sources.iter().all(|source| matches!(
+            &source.asset_ref,
+            Some(SourceAssetRef::File { uri, .. }) if uri == "mem://same.wav"
+        )));
+        let second = file_sources
+            .iter()
+            .find(|source| source.source_instance_id == second_id)
+            .expect("second instance appears in snapshot");
+        assert_eq!(second.playback.source_position_ms, Some(100));
+        assert_eq!(
+            second.timeline.active_windows[0].source_start_offset_ms,
+            100
+        );
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+        let peak_value = peak(&output);
+        assert!(
+            peak_value > 0.2,
+            "offset instance should start in the loud section, got peak {peak_value}"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_invalid_file_source_instances_are_rejected() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let bytes = stepped_wav();
+
+        runtime
+            .add_file_source_instance(file_request("file:dup", "mem://dup.wav", &bytes, 0))
+            .expect("first source accepted");
+        assert!(matches!(
+            runtime.add_file_source_instance(file_request("file:dup", "mem://dup.wav", &bytes, 0)),
+            Err(SourceInstanceError::DuplicateSourceInstance { .. })
+        ));
+        assert!(matches!(
+            runtime.add_file_source_instance(file_request("bad id", "mem://bad.wav", &bytes, 0)),
+            Err(SourceInstanceError::Validation(
+                SourceTimelineValidationError::InvalidSourceInstanceId { .. }
+            ))
+        ));
+        assert!(matches!(
+            runtime.add_file_source_instance(file_request(
+                "legacy:mic",
+                "mem://reserved.wav",
+                &bytes,
+                0
+            )),
+            Err(SourceInstanceError::ReservedSourceInstanceId { .. })
+        ));
+    }
+
+    #[test]
+    fn file_instance_start_offset_must_be_inside_file_duration() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let bytes = stepped_wav();
+
+        let result = runtime.add_file_source_instance(file_request(
+            "file:past-end",
+            "mem://past-end.wav",
+            &bytes,
+            1_000,
+        ));
+
+        assert!(matches!(
+            result,
+            Err(SourceInstanceError::StartOffsetBeyondDuration {
+                start_offset_ms: 1_000,
+                duration_ms: 500
+            })
+        ));
+        assert!(runtime.source_timeline_snapshot().sources.is_empty());
+    }
+
+    #[test]
+    fn file_instance_controls_update_effect_status_and_rendering() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:controlled");
+        let bytes = sine_wav(2_000, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://controlled.wav", &bytes, 0))
+            .expect("file source accepted");
+        runtime
+            .set_source_instance_gain_db(&id, -6.0, 0)
+            .expect("gain control accepted");
+        runtime
+            .set_source_instance_pan(&id, -1.0, 0)
+            .expect("pan control accepted");
+        runtime
+            .set_source_instance_highpass_hz(&id, 80.0)
+            .expect("highpass control accepted");
+        runtime
+            .set_source_instance_lowpass_hz(&id, 12_000.0)
+            .expect("lowpass control accepted");
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("controlled source appears in snapshot");
+        assert_eq!(source.effects.gain_db, -6.0);
+        assert_eq!(source.effects.pan, -1.0);
+        assert_eq!(source.effects.highpass_hz, 80.0);
+        assert_eq!(source.effects.lowpass_hz, 12_000.0);
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+        let left_peak = output
+            .iter()
+            .fold(0.0_f32, |current, frame| current.max(frame.left.abs()));
+        let right_peak = output
+            .iter()
+            .fold(0.0_f32, |current, frame| current.max(frame.right.abs()));
+        assert!(
+            left_peak > 0.15,
+            "left should remain audible, got {left_peak}"
+        );
+        assert!(
+            right_peak < 0.01,
+            "hard-left pan should remove right channel"
+        );
+    }
+
+    #[test]
+    fn file_instance_stop_fades_then_reports_stopped() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:fade-stop");
+        let bytes = sine_wav(2_000, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://fade.wav", &bytes, 0))
+            .expect("file source accepted");
+        runtime
+            .stop_source_instance(&id, 128)
+            .expect("stop with fade accepted");
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+        assert!(peak(&output) > 0.01, "fade block should still be audible");
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("stopped source appears in snapshot");
+        assert_eq!(source.playback.state, PlaybackState::Stopped);
+
+        output.fill(StereoFrame::SILENCE);
+        runtime.render_block(&mut output);
+        let stopped_peak = peak(&output);
+        assert!(
+            stopped_peak < 0.005,
+            "stopped source should be silent, got {stopped_peak}"
         );
     }
 

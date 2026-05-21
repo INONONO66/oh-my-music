@@ -4,12 +4,22 @@ use crate::dsp::{
 };
 use crate::frame::StereoFrame;
 use crate::source::AudioSource;
-use omm_protocol::{SourceEffectStatus, SourceId, SourcePlaybackStatus, TimelineSourceInstance};
+use omm_protocol::{
+    PlaybackState, PlaybackStatusAuthority, SourceAssetRef, SourceEffectStatus, SourceId,
+    SourceInstanceId, SourceKind, SourcePlaybackStatus, SourceTimelinePlacement,
+    TimelineActiveWindow, TimelineSourceInstance,
+};
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 
 pub struct ChannelStrip {
-    source_id: SourceId,
+    legacy_source_id: Option<SourceId>,
+    source_instance_id: SourceInstanceId,
+    source_kind: SourceKind,
+    asset_ref: Option<SourceAssetRef>,
+    timeline: SourceTimelinePlacement,
+    playback_authority: PlaybackStatusAuthority,
+    playback_state: PlaybackState,
     source: Box<dyn AudioSource>,
     gain_db: SmoothedParam,
     pan: SmoothedParam,
@@ -17,14 +27,71 @@ pub struct ChannelStrip {
     lowpass: OnePoleLowpass,
     scratch: Vec<StereoFrame>,
     enabled: bool,
+    pending_stop_after_frames: Option<usize>,
     analysis_producer: Option<HeapProd<f32>>,
     analysis_scratch: Vec<f32>,
 }
 
+struct ChannelStripMetadata {
+    legacy_source_id: Option<SourceId>,
+    source_instance_id: SourceInstanceId,
+    source_kind: SourceKind,
+    asset_ref: Option<SourceAssetRef>,
+    timeline: SourceTimelinePlacement,
+    playback_authority: PlaybackStatusAuthority,
+}
+
 impl ChannelStrip {
     pub fn new(source_id: SourceId, source: Box<dyn AudioSource>, sample_rate: u32) -> Self {
+        Self::new_with_metadata(
+            ChannelStripMetadata {
+                legacy_source_id: Some(source_id),
+                source_instance_id: SourceInstanceId::legacy(source_id),
+                source_kind: SourceKind::from_legacy_source(source_id),
+                asset_ref: legacy_asset_ref(source_id),
+                timeline: SourceTimelinePlacement::legacy_always_on(),
+                playback_authority: PlaybackStatusAuthority::LegacyChannelEnabled,
+            },
+            source,
+            sample_rate,
+        )
+    }
+
+    pub fn new_timeline_source(
+        source_instance_id: SourceInstanceId,
+        source_kind: SourceKind,
+        asset_ref: Option<SourceAssetRef>,
+        timeline: SourceTimelinePlacement,
+        source: Box<dyn AudioSource>,
+        sample_rate: u32,
+    ) -> Self {
+        Self::new_with_metadata(
+            ChannelStripMetadata {
+                legacy_source_id: None,
+                source_instance_id,
+                source_kind,
+                asset_ref,
+                timeline,
+                playback_authority: PlaybackStatusAuthority::TimelineTransport,
+            },
+            source,
+            sample_rate,
+        )
+    }
+
+    fn new_with_metadata(
+        metadata: ChannelStripMetadata,
+        source: Box<dyn AudioSource>,
+        sample_rate: u32,
+    ) -> Self {
         Self {
-            source_id,
+            legacy_source_id: metadata.legacy_source_id,
+            source_instance_id: metadata.source_instance_id,
+            source_kind: metadata.source_kind,
+            asset_ref: metadata.asset_ref,
+            timeline: metadata.timeline,
+            playback_authority: metadata.playback_authority,
+            playback_state: PlaybackState::Playing,
             source,
             gain_db: SmoothedParam::new(0.0),
             pan: SmoothedParam::new(0.0),
@@ -32,19 +99,55 @@ impl ChannelStrip {
             lowpass: OnePoleLowpass::new(20_000.0, sample_rate),
             scratch: Vec::with_capacity(MAX_BLOCK_FRAMES),
             enabled: true,
+            pending_stop_after_frames: None,
             analysis_producer: None,
             analysis_scratch: Vec::with_capacity(MAX_BLOCK_FRAMES),
         }
     }
 
-    pub fn source_id(&self) -> SourceId {
-        self.source_id
+    pub fn legacy_source_id(&self) -> Option<SourceId> {
+        self.legacy_source_id
     }
 
-    pub fn timeline_source_snapshot(&self) -> TimelineSourceInstance {
-        let playback = SourcePlaybackStatus::legacy_enabled(self.enabled);
+    pub fn source_instance_id(&self) -> &SourceInstanceId {
+        &self.source_instance_id
+    }
 
-        TimelineSourceInstance::legacy_channel(self.source_id, playback, self.effect_status())
+    pub fn timeline_source_snapshot(
+        &self,
+        engine_frame: u64,
+        sample_rate: u32,
+    ) -> TimelineSourceInstance {
+        let playback = self.playback_status(engine_frame, sample_rate);
+
+        TimelineSourceInstance {
+            source_instance_id: self.source_instance_id.clone(),
+            source_kind: self.source_kind,
+            asset_ref: self.asset_ref.clone(),
+            timeline: self.timeline.clone(),
+            playback,
+            effects: self.effect_status(),
+            legacy_bridge: self
+                .legacy_source_id
+                .map(|source_id| omm_protocol::LegacySourceBridge { source_id }),
+        }
+    }
+
+    fn playback_status(&self, engine_frame: u64, sample_rate: u32) -> SourcePlaybackStatus {
+        if self.playback_authority == PlaybackStatusAuthority::LegacyChannelEnabled {
+            return SourcePlaybackStatus::legacy_enabled(self.enabled);
+        }
+
+        SourcePlaybackStatus {
+            state: self.playback_state,
+            authority: self.playback_authority,
+            timeline_position_ms: Some(frames_to_ms(engine_frame, sample_rate)),
+            source_position_ms: self
+                .source
+                .position_frames()
+                .map(|frames| frames_to_ms(frames, sample_rate)),
+            loop_enabled: false,
+        }
     }
 
     fn effect_status(&self) -> SourceEffectStatus {
@@ -79,6 +182,21 @@ impl ChannelStrip {
         self.lowpass.process(&mut self.scratch[..n]);
         output.copy_from_slice(&self.scratch[..n]);
 
+        if self.source.is_finished() {
+            self.playback_state = PlaybackState::Ended;
+        }
+
+        if let Some(frames_left) = self.pending_stop_after_frames {
+            if n >= frames_left {
+                self.enabled = false;
+                self.source.set_enabled(false);
+                self.pending_stop_after_frames = None;
+                self.playback_state = PlaybackState::Stopped;
+            } else {
+                self.pending_stop_after_frames = Some(frames_left - n);
+            }
+        }
+
         if let Some(producer) = &mut self.analysis_producer {
             self.analysis_scratch.resize(n, 0.0);
             for (i, frame) in output.iter().enumerate() {
@@ -109,10 +227,59 @@ impl ChannelStrip {
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         self.source.set_enabled(enabled);
+        self.pending_stop_after_frames = None;
+        self.playback_state = if enabled {
+            PlaybackState::Playing
+        } else {
+            PlaybackState::Stopped
+        };
+    }
+
+    pub fn stop(&mut self, fade_frames: u32) {
+        if fade_frames == 0 {
+            self.set_enabled(false);
+            return;
+        }
+
+        self.gain_db.set_target(-60.0, fade_frames);
+        self.pending_stop_after_frames = Some(fade_frames as usize);
     }
 
     pub fn attach_analysis_producer(&mut self, producer: HeapProd<f32>) {
         self.analysis_producer = Some(producer);
+    }
+}
+
+fn frames_to_ms(frames: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    ((frames as u128 * 1_000) / sample_rate as u128) as u64
+}
+
+fn legacy_asset_ref(source_id: SourceId) -> Option<SourceAssetRef> {
+    match source_id {
+        SourceId::System => Some(SourceAssetRef::LiveInput {
+            label: "system".to_string(),
+        }),
+        SourceId::Mic => Some(SourceAssetRef::LiveInput {
+            label: "mic".to_string(),
+        }),
+        SourceId::Player => None,
+        SourceId::Glicol => Some(SourceAssetRef::Generated {
+            engine: omm_protocol::GeneratedEngine::Glicol,
+            code_ref: None,
+        }),
+    }
+}
+
+pub(crate) fn file_timeline(start_ms: u64, source_start_offset_ms: u64) -> SourceTimelinePlacement {
+    SourceTimelinePlacement {
+        active_windows: vec![TimelineActiveWindow {
+            timeline_start_ms: start_ms,
+            timeline_end_ms: None,
+            source_start_offset_ms,
+        }],
     }
 }
 
