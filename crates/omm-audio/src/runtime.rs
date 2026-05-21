@@ -1,6 +1,7 @@
 use crate::channel::file_timeline;
 use crate::command::{
-    new_command_channel, CommandQueue, CommandReceiver, RtCommand, MAX_DRAIN_PER_BLOCK,
+    new_command_channel, CommandQueue, CommandReceiver, RtCommand, RtSourceInstanceId,
+    MAX_DRAIN_PER_BLOCK,
 };
 use crate::dsp::{
     apply_gain_block, apply_pan_block, nan_guard_and_clamp, OnePoleHighpass, OnePoleLowpass,
@@ -16,7 +17,7 @@ use crate::{
     RtCommandSchedulerError,
 };
 use omm_protocol::{
-    frames_for_duration_ms, SourceAssetRef, SourceId, SourceInstanceId, SourceKind,
+    frames_for_duration_ms, ParamId, SourceAssetRef, SourceId, SourceInstanceId, SourceKind,
     SourceTimelineSnapshot, SourceTimelineValidationError,
 };
 use ringbuf::traits::Split;
@@ -40,6 +41,24 @@ pub struct FileSourceInstanceRequest {
     pub lowpass_hz: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceAutomationTarget {
+    GainDb,
+    Pan,
+    EqLowGainDb,
+    EqMidGainDb,
+    EqHighGainDb,
+    ReverbSendDb,
+    PlaybackRate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceAutomationRamp {
+    pub target: SourceAutomationTarget,
+    pub end_value: f32,
+    pub duration_frames: u32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SourceInstanceError {
     #[error(transparent)]
@@ -57,6 +76,17 @@ pub enum SourceInstanceError {
     Player(#[from] PlayerSourceError),
     #[error("source instance not found: {source_instance_id}")]
     SourceInstanceNotFound { source_instance_id: String },
+    #[error("source instance {source_instance_id} does not support {operation}")]
+    UnsupportedSourceOperation {
+        source_instance_id: String,
+        operation: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceInstanceRtCommandError {
+    NotFound,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +108,8 @@ pub struct AudioRuntime {
     feature_registry: FeatureRegistry,
     scheduler: RtCommandScheduler,
     rendered_frames: u64,
+    dropped_source_instance_rt_commands: u64,
+    unsupported_source_instance_rt_commands: u64,
 }
 
 impl AudioRuntime {
@@ -101,6 +133,8 @@ impl AudioRuntime {
                 feature_registry,
                 scheduler: RtCommandScheduler::default(),
                 rendered_frames: 0,
+                dropped_source_instance_rt_commands: 0,
+                unsupported_source_instance_rt_commands: 0,
             },
             command_queue,
             analyzer,
@@ -255,6 +289,183 @@ impl AudioRuntime {
         Ok(())
     }
 
+    pub fn set_source_instance_eq_gains_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        low_db: f32,
+        mid_db: f32,
+        high_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_eq_gains_db(
+            finite_clamped_param(ParamId::EqLowGainDb, low_db, 0.0),
+            finite_clamped_param(ParamId::EqMidGainDb, mid_db, 0.0),
+            finite_clamped_param(ParamId::EqHighGainDb, high_db, 0.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    pub fn set_source_instance_eq_low_gain_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        low_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_eq_low_gain_db(
+            finite_clamped_param(ParamId::EqLowGainDb, low_db, 0.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    pub fn set_source_instance_eq_mid_gain_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        mid_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_eq_mid_gain_db(
+            finite_clamped_param(ParamId::EqMidGainDb, mid_db, 0.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    pub fn set_source_instance_eq_high_gain_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        high_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_eq_high_gain_db(
+            finite_clamped_param(ParamId::EqHighGainDb, high_db, 0.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    pub fn set_source_instance_reverb_send_db(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        send_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_reverb_send_db(
+            finite_clamped_param(ParamId::ReverbSendDb, send_db, -60.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    pub fn set_source_instance_playback_rate(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        rate: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        if !channel.set_playback_rate(sanitize_playback_rate(rate), ramp_frames) {
+            return Err(SourceInstanceError::UnsupportedSourceOperation {
+                source_instance_id: source_instance_id.as_str().to_string(),
+                operation: "playback_rate",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn set_source_instance_reverse(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        reverse: bool,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        if !channel.set_reverse(reverse) {
+            return Err(SourceInstanceError::UnsupportedSourceOperation {
+                source_instance_id: source_instance_id.as_str().to_string(),
+                operation: "reverse",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn automate_source_instance(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        ramp: SourceAutomationRamp,
+    ) -> Result<(), SourceInstanceError> {
+        match ramp.target {
+            SourceAutomationTarget::GainDb => self.set_source_instance_gain_db(
+                source_instance_id,
+                finite_clamped_param(ParamId::GainDb, ramp.end_value, 0.0),
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::Pan => self.set_source_instance_pan(
+                source_instance_id,
+                finite_clamped_param(ParamId::Pan, ramp.end_value, 0.0),
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::EqLowGainDb => self.set_source_instance_eq_low_gain_db(
+                source_instance_id,
+                ramp.end_value,
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::EqMidGainDb => self.set_source_instance_eq_mid_gain_db(
+                source_instance_id,
+                ramp.end_value,
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::EqHighGainDb => self.set_source_instance_eq_high_gain_db(
+                source_instance_id,
+                ramp.end_value,
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::ReverbSendDb => self.set_source_instance_reverb_send_db(
+                source_instance_id,
+                ramp.end_value,
+                ramp.duration_frames,
+            ),
+            SourceAutomationTarget::PlaybackRate => self.set_source_instance_playback_rate(
+                source_instance_id,
+                ramp.end_value,
+                ramp.duration_frames,
+            ),
+        }
+    }
+
     pub fn render_block(&mut self, output: &mut [StereoFrame]) {
         let drained_commands = self.drain_commands(MAX_DRAIN_PER_BLOCK);
         self.drain_scheduled_commands(MAX_DRAIN_PER_BLOCK.saturating_sub(drained_commands));
@@ -280,6 +491,14 @@ impl AudioRuntime {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    pub fn dropped_source_instance_rt_commands(&self) -> u64 {
+        self.dropped_source_instance_rt_commands
+    }
+
+    pub fn unsupported_source_instance_rt_commands(&self) -> u64 {
+        self.unsupported_source_instance_rt_commands
     }
 
     /// Schedules an RT command against the runtime's current engine-frame position.
@@ -421,6 +640,131 @@ impl AudioRuntime {
             .find(|channel| channel.source_instance_id() == source_instance_id)
     }
 
+    fn channel_by_instance_id_str_mut(
+        &mut self,
+        source_instance_id: &RtSourceInstanceId,
+    ) -> Option<&mut ChannelStrip> {
+        let source_instance_id = source_instance_id.as_str();
+        self.channels
+            .iter_mut()
+            .find(|channel| channel.source_instance_id().as_str() == source_instance_id)
+    }
+
+    fn set_source_instance_gain_db_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_gain_db(db, ramp_frames);
+        Ok(())
+    }
+
+    fn set_source_instance_pan_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        pan: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_pan(pan, ramp_frames);
+        Ok(())
+    }
+
+    fn set_source_instance_highpass_hz_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        hz: f32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_highpass_hz(hz);
+        Ok(())
+    }
+
+    fn set_source_instance_lowpass_hz_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        hz: f32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_lowpass_hz(hz);
+        Ok(())
+    }
+
+    fn set_source_instance_eq_gains_db_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        low_db: f32,
+        mid_db: f32,
+        high_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_eq_gains_db(
+            finite_clamped_param(ParamId::EqLowGainDb, low_db, 0.0),
+            finite_clamped_param(ParamId::EqMidGainDb, mid_db, 0.0),
+            finite_clamped_param(ParamId::EqHighGainDb, high_db, 0.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    fn set_source_instance_reverb_send_db_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        send_db: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_reverb_send_db(
+            finite_clamped_param(ParamId::ReverbSendDb, send_db, -60.0),
+            ramp_frames,
+        );
+        Ok(())
+    }
+
+    fn set_source_instance_playback_rate_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        rate: f32,
+        ramp_frames: u32,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        if !channel.set_playback_rate(sanitize_playback_rate(rate), ramp_frames) {
+            return Err(SourceInstanceRtCommandError::Unsupported);
+        }
+        Ok(())
+    }
+
+    fn set_source_instance_reverse_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        reverse: bool,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        if !channel.set_reverse(reverse) {
+            return Err(SourceInstanceRtCommandError::Unsupported);
+        }
+        Ok(())
+    }
+
     fn drain_commands(&mut self, max: usize) -> usize {
         let mut count = 0;
 
@@ -457,6 +801,25 @@ impl AudioRuntime {
         }
 
         count
+    }
+
+    fn observe_source_instance_command_result(
+        &mut self,
+        result: Result<(), SourceInstanceRtCommandError>,
+    ) {
+        if let Err(error) = result {
+            match error {
+                SourceInstanceRtCommandError::Unsupported => {
+                    self.unsupported_source_instance_rt_commands = self
+                        .unsupported_source_instance_rt_commands
+                        .saturating_add(1);
+                }
+                SourceInstanceRtCommandError::NotFound => {
+                    self.dropped_source_instance_rt_commands =
+                        self.dropped_source_instance_rt_commands.saturating_add(1);
+                }
+            }
+        }
     }
 
     fn apply_command(&mut self, cmd: RtCommand) {
@@ -496,7 +859,101 @@ impl AudioRuntime {
             RtCommand::SetChannelEnabled { source_id, enabled } => {
                 self.set_channel_enabled(source_id, enabled);
             }
+            RtCommand::SetSourceInstanceGainDb {
+                source_instance_id,
+                db,
+                ramp_frames,
+            } => {
+                let result =
+                    self.set_source_instance_gain_db_rt(source_instance_id, db, ramp_frames);
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstancePan {
+                source_instance_id,
+                pan,
+                ramp_frames,
+            } => {
+                let result = self.set_source_instance_pan_rt(source_instance_id, pan, ramp_frames);
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstanceHighpassHz {
+                source_instance_id,
+                hz,
+            } => {
+                let result = self.set_source_instance_highpass_hz_rt(source_instance_id, hz);
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstanceLowpassHz {
+                source_instance_id,
+                hz,
+            } => {
+                let result = self.set_source_instance_lowpass_hz_rt(source_instance_id, hz);
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstanceEq {
+                source_instance_id,
+                low_db,
+                mid_db,
+                high_db,
+                ramp_frames,
+            } => {
+                let result = self.set_source_instance_eq_gains_db_rt(
+                    source_instance_id,
+                    low_db,
+                    mid_db,
+                    high_db,
+                    ramp_frames,
+                );
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id,
+                send_db,
+                ramp_frames,
+            } => {
+                let result = self.set_source_instance_reverb_send_db_rt(
+                    source_instance_id,
+                    send_db,
+                    ramp_frames,
+                );
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstancePlaybackRate {
+                source_instance_id,
+                rate,
+                ramp_frames,
+            } => {
+                let result = self.set_source_instance_playback_rate_rt(
+                    source_instance_id,
+                    rate,
+                    ramp_frames,
+                );
+                self.observe_source_instance_command_result(result);
+            }
+            RtCommand::SetSourceInstanceReverse {
+                source_instance_id,
+                reverse,
+            } => {
+                let result = self.set_source_instance_reverse_rt(source_instance_id, reverse);
+                self.observe_source_instance_command_result(result);
+            }
         }
+    }
+}
+
+fn finite_clamped_param(param: ParamId, value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        omm_protocol::validation::clamp_param(param, value)
+    } else {
+        fallback
+    }
+}
+
+fn sanitize_playback_rate(rate: f32) -> f32 {
+    if rate.is_finite() {
+        rate.clamp(0.25, 4.0)
+    } else {
+        1.0
     }
 }
 
@@ -637,6 +1094,24 @@ mod tests {
             .map(|index| {
                 let phase = std::f32::consts::TAU * freq_hz * index as f32 / SAMPLE_RATE as f32;
                 (phase.sin() * i16::MAX as f32 * 0.5) as i16
+            })
+            .collect();
+        mono_wav(SAMPLE_RATE, &samples)
+    }
+
+    fn impulse_wav(frames: usize) -> Vec<u8> {
+        let mut samples = vec![0_i16; frames];
+        if let Some(first) = samples.first_mut() {
+            *first = (i16::MAX as f32 * 0.5) as i16;
+        }
+        mono_wav(SAMPLE_RATE, &samples)
+    }
+
+    fn ramp_wav(frames: usize) -> Vec<u8> {
+        let samples: Vec<i16> = (0..frames)
+            .map(|index| {
+                let value = (index as f32 / frames.max(1) as f32) * 2.0 - 1.0;
+                (value * i16::MAX as f32 * 0.5) as i16
             })
             .collect();
         mono_wav(SAMPLE_RATE, &samples)
@@ -873,6 +1348,269 @@ mod tests {
             stopped_peak < 0.005,
             "stopped source should be silent, got {stopped_peak}"
         );
+    }
+
+    #[test]
+    fn file_instance_eq_reverb_and_automation_update_status_and_audio() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:effects");
+        let bytes = impulse_wav(2_000);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://impulse.wav", &bytes, 0))
+            .expect("file source accepted");
+        runtime
+            .set_source_instance_eq_gains_db(&id, 6.0, -3.0, 4.0, 0)
+            .expect("eq control accepted");
+        runtime
+            .set_source_instance_reverb_send_db(&id, 0.0, 0)
+            .expect("reverb control accepted");
+        runtime
+            .automate_source_instance(
+                &id,
+                SourceAutomationRamp {
+                    target: SourceAutomationTarget::GainDb,
+                    end_value: -12.0,
+                    duration_frames: 128,
+                },
+            )
+            .expect("gain automation accepted");
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+        assert!(
+            output.iter().skip(2).any(|frame| frame.left.abs() > 0.01),
+            "reverb should create a delayed source-local tail"
+        );
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("effects source appears in snapshot");
+        assert!((source.effects.gain_db - -12.0).abs() < 0.001);
+        assert_eq!(source.effects.eq.low_gain_db, 6.0);
+        assert_eq!(source.effects.eq.mid_gain_db, -3.0);
+        assert_eq!(source.effects.eq.high_gain_db, 4.0);
+        assert_eq!(source.effects.reverb_send_db, 0.0);
+    }
+
+    #[test]
+    fn independent_eq_band_automation_preserves_other_band_targets() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:eq-independent");
+        let bytes = sine_wav(2_000, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://eq.wav", &bytes, 0))
+            .expect("file source accepted");
+        runtime
+            .automate_source_instance(
+                &id,
+                SourceAutomationRamp {
+                    target: SourceAutomationTarget::EqLowGainDb,
+                    end_value: 6.0,
+                    duration_frames: 128,
+                },
+            )
+            .expect("low EQ automation accepted");
+        runtime
+            .automate_source_instance(
+                &id,
+                SourceAutomationRamp {
+                    target: SourceAutomationTarget::EqMidGainDb,
+                    end_value: -3.0,
+                    duration_frames: 128,
+                },
+            )
+            .expect("mid EQ automation accepted");
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("EQ source appears in snapshot");
+        assert!((source.effects.eq.low_gain_db - 6.0).abs() < 0.001);
+        assert!((source.effects.eq.mid_gain_db - -3.0).abs() < 0.001);
+        assert!((source.effects.eq.high_gain_db - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn non_finite_playback_rate_falls_back_to_normal_speed() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:nan-rate");
+        let bytes = sine_wav(2_000, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://nan-rate.wav", &bytes, 0))
+            .expect("file source accepted");
+        runtime
+            .set_source_instance_playback_rate(&id, f32::NAN, 0)
+            .expect("NaN rate is sanitized, not fatal");
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+        assert!(
+            peak(&output) > 0.01,
+            "sanitized rate should still render audio"
+        );
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("rate source appears in snapshot");
+        assert_eq!(source.effects.playback_rate, 1.0);
+    }
+
+    #[test]
+    fn file_instance_playback_rate_and_reverse_control_transport() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:transport-effects");
+        let bytes = ramp_wav(12_000);
+
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://ramp.wav", &bytes, 100))
+            .expect("file source accepted");
+        runtime
+            .set_source_instance_playback_rate(&id, 2.0, 0)
+            .expect("rate control accepted");
+        let mut output = vec![StereoFrame::SILENCE; 512];
+        runtime.render_block(&mut output);
+        let fast_position = runtime
+            .source_timeline_snapshot()
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .and_then(|source| source.playback.source_position_ms)
+            .expect("source position reported after fast playback");
+        assert!(
+            fast_position >= 120,
+            "2x playback should advance beyond 120ms, got {fast_position}"
+        );
+
+        runtime
+            .set_source_instance_reverse(&id, true)
+            .expect("reverse control accepted");
+        runtime.render_block(&mut output);
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("transport source appears in snapshot");
+        let reversed_position = source
+            .playback
+            .source_position_ms
+            .expect("source position reported after reverse playback");
+        assert!(
+            reversed_position < fast_position,
+            "reverse playback should move backward from {fast_position}ms, got {reversed_position}"
+        );
+        assert_eq!(source.effects.playback_rate, 2.0);
+        assert!(source.effects.reverse);
+    }
+
+    #[test]
+    fn scheduled_source_instance_effect_command_applies_at_engine_time() {
+        let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:scheduled-effects");
+        let bytes = sine_wav(2_000, 440.0);
+        runtime
+            .add_file_source_instance(file_request(id.as_str(), "mem://scheduled.wav", &bytes, 0))
+            .expect("file source accepted");
+
+        runtime
+            .schedule_rt_command(RtCommandScheduleRequest {
+                action_id: ScheduledActionId::new("schedule-source-eq"),
+                origin: ActionOrigin::Test,
+                trigger_frame: 0,
+                command: RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(id.as_str()),
+                    low_db: 4.0,
+                    mid_db: -2.0,
+                    high_db: 3.0,
+                    ramp_frames: 0,
+                },
+            })
+            .expect("source effect command scheduled");
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("scheduled source appears in snapshot");
+        assert_eq!(source.effects.eq.low_gain_db, 4.0);
+        assert_eq!(source.effects.eq.mid_gain_db, -2.0);
+        assert_eq!(source.effects.eq.high_gain_db, 3.0);
+    }
+
+    #[test]
+    fn rt_source_instance_eq_and_reverb_values_are_sanitized() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        let id = SourceInstanceId::new("file:rt-sanitized");
+        let bytes = sine_wav(2_000, 440.0);
+        runtime
+            .add_file_source_instance(file_request(
+                id.as_str(),
+                "mem://rt-sanitized.wav",
+                &bytes,
+                0,
+            ))
+            .expect("file source accepted");
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceEq {
+                source_instance_id: RtSourceInstanceId::new(id.as_str()),
+                low_db: f32::NAN,
+                mid_db: 99.0,
+                high_db: -99.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id: RtSourceInstanceId::new(id.as_str()),
+                send_db: f32::NAN,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 128];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+        let source = snapshot
+            .sources
+            .iter()
+            .find(|source| source.source_instance_id == id)
+            .expect("RT-sanitized source appears in snapshot");
+        assert_eq!(source.effects.eq.low_gain_db, 0.0);
+        assert_eq!(source.effects.eq.mid_gain_db, 12.0);
+        assert_eq!(source.effects.eq.high_gain_db, -12.0);
+        assert_eq!(source.effects.reverb_send_db, -60.0);
     }
 
     #[test]
@@ -1529,6 +2267,39 @@ mod tests {
             p > 0.5,
             "expected Glicol channel unaffected by unknown source command, got peak {p}"
         );
+    }
+
+    #[test]
+    fn source_instance_rt_command_failures_are_counted() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+        add_test_channel(
+            &mut runtime,
+            SourceId::Glicol,
+            Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+        );
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("file:missing"),
+                db: -6.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstancePlaybackRate {
+                source_instance_id: RtSourceInstanceId::new("legacy:glicol"),
+                rate: 2.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+
+        assert_eq!(runtime.dropped_source_instance_rt_commands(), 1);
+        assert_eq!(runtime.unsupported_source_instance_rt_commands(), 1);
     }
 
     #[test]

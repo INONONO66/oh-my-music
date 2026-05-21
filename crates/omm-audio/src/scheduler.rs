@@ -31,7 +31,10 @@ enum ScheduledRtCommandState {
 
 #[derive(Debug, Clone, PartialEq)]
 struct ScheduledRtCommandEntry {
-    action: ScheduledRtCommand,
+    action_id: ScheduledActionId,
+    origin: ActionOrigin,
+    trigger_frame: u64,
+    command: Option<RtCommand>,
     state: ScheduledRtCommandState,
 }
 
@@ -83,12 +86,10 @@ impl RtCommandScheduler {
         self.scheduled.insert(
             key.clone(),
             ScheduledRtCommandEntry {
-                action: ScheduledRtCommand {
-                    action_id: validation.action_id,
-                    origin: validation.origin,
-                    trigger_frame: validation.timing.trigger_frame,
-                    command: request.command,
-                },
+                action_id: validation.action_id,
+                origin: validation.origin,
+                trigger_frame: validation.timing.trigger_frame,
+                command: Some(request.command),
                 state: ScheduledRtCommandState::Pending,
             },
         );
@@ -152,9 +153,14 @@ impl RtCommandScheduler {
         self.reclaim_dispatched();
         self.scheduled
             .remove(action_id.as_str())
-            .map(|entry| {
-                self.remove_due_key(entry.action.trigger_frame, action_id.as_str());
-                entry.action
+            .and_then(|entry| {
+                self.remove_due_key(entry.trigger_frame, action_id.as_str());
+                entry.command.map(|command| ScheduledRtCommand {
+                    action_id: entry.action_id,
+                    origin: entry.origin,
+                    trigger_frame: entry.trigger_frame,
+                    command,
+                })
             })
             .ok_or_else(|| RtCommandSchedulerError::ActionNotFound {
                 action_id: action_id.as_str().to_string(),
@@ -176,8 +182,8 @@ impl RtCommandScheduler {
             });
         };
         let validation = validate_schedule_request(
-            scheduled.action.action_id.clone(),
-            scheduled.action.origin,
+            scheduled.action_id.clone(),
+            scheduled.origin,
             ScheduleRequestTiming {
                 submitted_at_frame: now_frame,
                 trigger_frame: new_trigger_frame,
@@ -187,14 +193,14 @@ impl RtCommandScheduler {
 
         match validation {
             Ok(validation) => {
-                let old_trigger_frame = scheduled.action.trigger_frame;
+                let old_trigger_frame = scheduled.trigger_frame;
                 self.remove_due_key(old_trigger_frame, action_id.as_str());
                 let Some(scheduled) = self.scheduled.get_mut(action_id.as_str()) else {
                     return Err(RtCommandSchedulerError::ActionNotFound {
                         action_id: action_id_key,
                     });
                 };
-                scheduled.action.trigger_frame = validation.timing.trigger_frame;
+                scheduled.trigger_frame = validation.timing.trigger_frame;
                 self.insert_due_key(validation.timing.trigger_frame, action_id_key);
                 Ok(())
             }
@@ -213,13 +219,16 @@ impl RtCommandScheduler {
                 continue;
             };
             if entry.state != ScheduledRtCommandState::Pending
-                || entry.action.trigger_frame != key.trigger_frame
+                || entry.trigger_frame != key.trigger_frame
             {
                 continue;
             }
 
+            let Some(command) = entry.command.take() else {
+                continue;
+            };
             entry.state = ScheduledRtCommandState::Dispatched;
-            return Some(entry.action.command);
+            return Some(command);
         }
 
         None

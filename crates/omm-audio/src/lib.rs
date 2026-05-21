@@ -14,8 +14,9 @@ pub mod understanding;
 
 pub use channel::ChannelStrip;
 pub use command::{
-    new_command_channel, CommandQueue, CommandReceiver, QueueFull, RtCommand, MAX_DRAIN_PER_BLOCK,
-    RT_QUEUE_CAPACITY,
+    new_command_channel, CommandQueue, CommandReceiver, QueueFull, RtCommand, RtSourceInstanceId,
+    RtSourceInstanceIdError, MAX_DRAIN_PER_BLOCK, RT_QUEUE_CAPACITY,
+    RT_SOURCE_INSTANCE_ID_CAPACITY,
 };
 pub use constants::{ENGINE_CHANNELS, ENGINE_SAMPLE_RATE, MAX_BLOCK_FRAMES};
 pub use features::{
@@ -24,7 +25,8 @@ pub use features::{
 pub use frame::StereoFrame;
 pub use meter::MeterSnapshot;
 pub use runtime::{
-    AudioRuntime, AudioRuntimeConfig, FileSourceInstanceRequest, SourceInstanceError,
+    AudioRuntime, AudioRuntimeConfig, FileSourceInstanceRequest, SourceAutomationRamp,
+    SourceAutomationTarget, SourceInstanceError,
 };
 pub use scheduler::{
     RtCommandScheduleRequest, RtCommandScheduler, RtCommandSchedulerError, ScheduledRtCommand,

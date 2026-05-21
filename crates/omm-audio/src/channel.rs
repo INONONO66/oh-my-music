@@ -1,6 +1,7 @@
 use crate::constants::MAX_BLOCK_FRAMES;
 use crate::dsp::{
-    apply_gain_block, apply_pan_block, OnePoleHighpass, OnePoleLowpass, SmoothedParam,
+    apply_gain_block, apply_pan_block, OnePoleHighpass, OnePoleLowpass, SimpleReverb,
+    SmoothedParam, ThreeBandEq,
 };
 use crate::frame::StereoFrame;
 use crate::source::AudioSource;
@@ -23,8 +24,10 @@ pub struct ChannelStrip {
     source: Box<dyn AudioSource>,
     gain_db: SmoothedParam,
     pan: SmoothedParam,
+    eq: ThreeBandEq,
     highpass: OnePoleHighpass,
     lowpass: OnePoleLowpass,
+    reverb: SimpleReverb,
     scratch: Vec<StereoFrame>,
     enabled: bool,
     pending_stop_after_frames: Option<usize>,
@@ -95,8 +98,10 @@ impl ChannelStrip {
             source,
             gain_db: SmoothedParam::new(0.0),
             pan: SmoothedParam::new(0.0),
+            eq: ThreeBandEq::new(sample_rate),
             highpass: OnePoleHighpass::new(20.0, sample_rate),
             lowpass: OnePoleLowpass::new(20_000.0, sample_rate),
+            reverb: SimpleReverb::new(sample_rate),
             scratch: Vec::with_capacity(MAX_BLOCK_FRAMES),
             enabled: true,
             pending_stop_after_frames: None,
@@ -156,7 +161,10 @@ impl ChannelStrip {
             pan: self.pan.current(),
             highpass_hz: self.highpass.cutoff_hz(),
             lowpass_hz: self.lowpass.cutoff_hz(),
-            ..SourceEffectStatus::default()
+            eq: self.eq.status(),
+            reverb_send_db: self.reverb.send_db(),
+            playback_rate: self.source.playback_rate().unwrap_or(1.0),
+            reverse: self.source.reverse().unwrap_or(false),
         }
     }
 
@@ -178,8 +186,10 @@ impl ChannelStrip {
         self.source.render(&mut self.scratch[..n]);
         apply_gain_block(&mut self.scratch[..n], &mut self.gain_db);
         apply_pan_block(&mut self.scratch[..n], &mut self.pan);
+        self.eq.process(&mut self.scratch[..n]);
         self.highpass.process(&mut self.scratch[..n]);
         self.lowpass.process(&mut self.scratch[..n]);
+        self.reverb.process(&mut self.scratch[..n]);
         output.copy_from_slice(&self.scratch[..n]);
 
         if self.source.is_finished() {
@@ -216,12 +226,44 @@ impl ChannelStrip {
         self.pan.set_target(pan, ramp_frames);
     }
 
+    pub fn set_eq_gains_db(&mut self, low_db: f32, mid_db: f32, high_db: f32, ramp_frames: u32) {
+        self.eq.set_gains_db(low_db, mid_db, high_db, ramp_frames);
+    }
+
+    pub fn set_eq_low_gain_db(&mut self, low_db: f32, ramp_frames: u32) {
+        self.eq.set_low_gain_db(low_db, ramp_frames);
+    }
+
+    pub fn set_eq_mid_gain_db(&mut self, mid_db: f32, ramp_frames: u32) {
+        self.eq.set_mid_gain_db(mid_db, ramp_frames);
+    }
+
+    pub fn set_eq_high_gain_db(&mut self, high_db: f32, ramp_frames: u32) {
+        self.eq.set_high_gain_db(high_db, ramp_frames);
+    }
+
+    pub fn eq_target_status(&self) -> omm_protocol::SourceEqStatus {
+        self.eq.target_status()
+    }
+
     pub fn set_highpass_hz(&mut self, hz: f32) {
         self.highpass.set_cutoff(hz);
     }
 
     pub fn set_lowpass_hz(&mut self, hz: f32) {
         self.lowpass.set_cutoff(hz);
+    }
+
+    pub fn set_reverb_send_db(&mut self, send_db: f32, ramp_frames: u32) {
+        self.reverb.set_send_db(send_db, ramp_frames);
+    }
+
+    pub fn set_playback_rate(&mut self, rate: f32, ramp_frames: u32) -> bool {
+        self.source.set_playback_rate(rate, ramp_frames)
+    }
+
+    pub fn set_reverse(&mut self, reverse: bool) -> bool {
+        self.source.set_reverse(reverse)
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
