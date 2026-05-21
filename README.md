@@ -28,7 +28,7 @@ docs/              # architecture docs and ADRs
 
 ## Current Status
 
-Early scaffold. The architecture draft lives at [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Early scaffold. The architecture draft lives at [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The current audio-understanding foundation includes deterministic schema fixtures and Rust per-channel feature snapshots for dynamics, spectral texture, onset rate, zero-crossing rate, and coarse labels.
 
 ## First Milestone
 

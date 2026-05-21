@@ -13,7 +13,8 @@ use crate::features::types::{BrightnessLabel, ChannelFeatures, EnergyLabel, Text
 
 const FFT_SIZE: usize = 2048;
 const HOP_SIZE: usize = 1024;
-const WINDOW_MS: u32 = 2000;
+pub const DEFAULT_FEATURE_WINDOW_MS: u32 = 2000;
+const WINDOW_MS: u32 = DEFAULT_FEATURE_WINDOW_MS;
 const SILENCE_DB: f32 = -120.0;
 const EPSILON: f32 = 1.0e-12;
 const ONSET_DB_THRESHOLD: f32 = -45.0;
@@ -100,6 +101,77 @@ impl FeatureRegistry {
     pub(crate) fn register_channel(&self, source_id: SourceId, consumer: HeapCons<f32>) {
         register_in_shared(&self.shared, source_id, consumer);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OfflineFeatureConfig {
+    pub window_ms: u32,
+    pub hop_ms: u32,
+}
+
+impl Default for OfflineFeatureConfig {
+    fn default() -> Self {
+        Self {
+            window_ms: DEFAULT_FEATURE_WINDOW_MS,
+            hop_ms: 500,
+        }
+    }
+}
+
+pub fn compute_offline_channel_features(
+    source_id: SourceId,
+    samples: &[f32],
+    sample_rate: u32,
+    config: OfflineFeatureConfig,
+) -> Vec<ChannelFeatures> {
+    let sample_rate = sample_rate.max(1);
+    let window_samples = ms_to_samples(config.window_ms.max(1), sample_rate).max(FFT_SIZE);
+    let hop_samples = ms_to_samples(config.hop_ms.max(1), sample_rate).max(1);
+    let mut computer = FeatureComputer::new(sample_rate);
+    let mut results = Vec::new();
+
+    if samples.is_empty() {
+        let silence = vec![0.0; window_samples];
+        results.push(computer.compute_with_duration(source_id, 0, 0, &silence));
+        return results;
+    }
+
+    let mut start = 0usize;
+    while start < samples.len() {
+        let end = (start + window_samples).min(samples.len());
+        let mut window = samples[start..end]
+            .iter()
+            .map(|sample| finite_or_zero(*sample))
+            .collect::<Vec<_>>();
+        let real_window_samples = end.saturating_sub(start);
+        let real_window_duration_ms = samples_to_duration_ms(real_window_samples, sample_rate);
+        if window.len() < window_samples {
+            window.resize(window_samples, 0.0);
+        }
+        results.push(computer.compute_with_duration(
+            source_id,
+            start as u64,
+            real_window_duration_ms,
+            &window,
+        ));
+        if start + hop_samples >= samples.len() {
+            break;
+        }
+        start += hop_samples;
+    }
+
+    results
+}
+
+fn ms_to_samples(ms: u32, sample_rate: u32) -> usize {
+    ((sample_rate as u64 * ms as u64) / 1_000).max(1) as usize
+}
+
+fn samples_to_duration_ms(samples: usize, sample_rate: u32) -> u32 {
+    if samples == 0 {
+        return 0;
+    }
+    ((samples as u64 * 1_000).div_ceil(sample_rate.max(1) as u64)) as u32
 }
 
 pub(crate) fn analysis_ringbuf_capacity(sample_rate: u32) -> usize {
@@ -194,7 +266,7 @@ impl AnalyzerChannel {
     }
 }
 
-struct FeatureComputer {
+pub(crate) struct FeatureComputer {
     sample_rate: u32,
     fft: Arc<dyn RealToComplex<f32>>,
     hann: Vec<f32>,
@@ -202,7 +274,7 @@ struct FeatureComputer {
 }
 
 impl FeatureComputer {
-    fn new(sample_rate: u32) -> Self {
+    pub(crate) fn new(sample_rate: u32) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let hann = (0..FFT_SIZE)
@@ -220,10 +292,20 @@ impl FeatureComputer {
         }
     }
 
-    fn compute(
+    pub(crate) fn compute(
         &mut self,
         source_id: SourceId,
         window_start_samples: u64,
+        samples: &[f32],
+    ) -> ChannelFeatures {
+        self.compute_with_duration(source_id, window_start_samples, WINDOW_MS, samples)
+    }
+
+    fn compute_with_duration(
+        &mut self,
+        source_id: SourceId,
+        window_start_samples: u64,
+        window_duration_ms: u32,
         samples: &[f32],
     ) -> ChannelFeatures {
         let dynamics = compute_dynamics(samples);
@@ -243,7 +325,7 @@ impl FeatureComputer {
         ChannelFeatures {
             source_id,
             window_start_ms: window_start_samples.saturating_mul(1000) / self.sample_rate as u64,
-            window_duration_ms: WINDOW_MS,
+            window_duration_ms,
             peak_db,
             rms_db,
             crest_factor,
@@ -621,6 +703,26 @@ mod tests {
         );
         assert_eq!(features.texture_label, TextureLabel::Noisy);
         analyzer.shutdown();
+    }
+
+    #[test]
+    fn offline_tail_window_reports_real_duration() {
+        let sample_rate = 48_000;
+        let samples = vec![0.25; sample_rate as usize * 5 / 2];
+        let features = compute_offline_channel_features(
+            SourceId::Player,
+            &samples,
+            sample_rate,
+            OfflineFeatureConfig {
+                window_ms: 2_000,
+                hop_ms: 1_500,
+            },
+        );
+
+        assert_eq!(features[0].window_start_ms, 0);
+        assert_eq!(features[0].window_duration_ms, 2_000);
+        assert_eq!(features[1].window_start_ms, 1_500);
+        assert_eq!(features[1].window_duration_ms, 1_000);
     }
 
     #[test]

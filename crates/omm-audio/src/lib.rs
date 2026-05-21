@@ -9,6 +9,7 @@ pub mod mixer;
 pub mod output;
 pub mod runtime;
 pub mod source;
+pub mod understanding;
 
 pub use channel::ChannelStrip;
 pub use command::{
@@ -22,6 +23,9 @@ pub use features::{
 pub use frame::StereoFrame;
 pub use meter::MeterSnapshot;
 pub use runtime::{AudioRuntime, AudioRuntimeConfig};
+pub use understanding::{
+    AudioUnderstandingConfig, OfflineAudioUnderstandingAnalyzer, SemanticAudioUnderstanding,
+};
 
 #[cfg(test)]
 mod compile_checks {

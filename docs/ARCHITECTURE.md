@@ -328,16 +328,17 @@ const MAX_COMMANDS_PER_BLOCK: usize = 64;
 
 ### 5.6 Analysis Ring Buffer
 
-오디오 콜백은 분석용 링 버퍼에 샘플만 쓴다. 별도 non-RT 스레드가 청크로 패키징하여 Bun에 전송.
+오디오 콜백은 per-channel 분석용 링 버퍼에 mono f32 다운믹스 샘플만 쓴다. 별도 non-RT 분석 스레드가 버퍼를 drain하여 `ChannelFeatures` 스냅샷을 계산한다. 현재 구현의 안정 계약은 다음과 같다.
 
-| Stream | Format | Chunk Size | Purpose |
-|--------|--------|-----------|---------|
-| `MixPost` | mono f32 48kHz | 100ms / 4800 frames | Meyda/Essentia |
-| `MicPre` | mono f32 16kHz | 100ms / 1600 frames | YAMNet 환경 분류 |
-| `SystemPre` | mono f32 48kHz | 100ms | 음악 분석 |
-| `MasterPost` | mono f32 48kHz | 100ms | UI/미터/디버그 |
+| Layer | Format | Cadence / Window | Purpose |
+|-------|--------|------------------|---------|
+| `ChannelStrip` analysis tap | mono f32, engine sample rate | render block마다 non-blocking push | RT 스레드에서 분석 샘플 복사 |
+| `FeatureAnalyzerHandle` | mono f32, per source channel | 2s window, 1024-sample hop | peak/RMS, trend, centroid, rolloff, flatness, onset rate, zero-crossing rate, coarse labels |
+| Offline audio-understanding fixture/schema | JSON-safe feature frames + evidence map | deterministic asset-level frames | sections/flow, BPM/beat, mood/feel, component estimates with confidence |
 
-링 버퍼 용량: 4초. 오버플로우 시 oldest 드롭 + 카운터 증가.
+링 버퍼 용량은 2초 분석 윈도우의 두 배와 hop 여유분을 포함하도록 샘플레이트에서 계산한다. Producer가 가득 차면 현재 샘플은 RT 안전을 위해 버려질 수 있으므로, 향후 public analysis stream에는 overflow counter를 추가해야 한다.
+
+현재 Audio Understanding 경계는 분석/증거 표현까지다. 출력은 DJ action recommendation, transition choice, generated-code sketch hint를 포함하지 않는다.
 
 ### 5.7 Core Audio Tap
 
@@ -663,43 +664,46 @@ type Envelope<T> = {
 
 ### 8.3 Agent → Engine Messages
 
-| Kind | Purpose |
-|------|---------|
-| `Hello` | 핸드셰이크 |
-| `StartSession` | 모드(tui/discord) + 출력 라우트 설정 |
-| `StopSession` | 페이드아웃 후 세션 종료 |
-| `SetCapture` | 시스템 오디오/마이크 캡처 on/off |
-| `SetParam` | 단일 파라미터 변경 |
-| `SetParamBatch` | 복수 파라미터 일괄 변경 (LLM 결정 1회분) |
-| `SetSourceState` | 소스 enable/mute/solo/gain |
-| `SetTransport` | play/pause, BPM, beat |
-| `GlicolLoadCode` | Glicol DSL 코드 로드 |
-| `GlicolSetParam` | Glicol 런타임 파라미터 변경 |
-| `PlayerLoad` | 음악 파일 로드 |
-| `PlayerControl` | play/pause/seek/loop |
-| `EmergencyFade` | 긴급 페이드아웃 |
-| `ResetDsp` | DSP 체인 초기화 |
-| `Subscribe` | 스트림 구독 (meters, analysis, discord-pcm) |
+The table below separates implemented protocol rows from planned contract direction. PR1 only adds the offline audio-understanding foundation and does not add new IPC commands/events.
+
+| Kind | Purpose | Status |
+|------|---------|--------|
+| `Hello` | 핸드셰이크 | implemented |
+| `StartSession` | 모드(tui/discord) + 출력 라우트 설정 | implemented |
+| `StopSession` | 페이드아웃 후 세션 종료 | implemented |
+| `SetCapture` | 시스템 오디오/마이크 캡처 on/off | implemented |
+| `SetParam` | 단일 파라미터 변경 | implemented |
+| `SetParamBatch` | 복수 파라미터 일괄 변경 (LLM 결정 1회분) | implemented |
+| `SetSourceMute` | 소스 mute 상태 변경 | implemented |
+| `GlicolLoadCode` | Glicol DSL 코드 로드 | implemented |
+| `EmergencyFade` | 긴급 페이드아웃 | implemented |
+| `RequestState` | 현재 엔진 상태 요청 | implemented |
+| `GlicolSetParam` | Glicol 런타임 파라미터 변경 | planned |
+| `PlayerLoad` | 음악 파일 로드 | planned |
+| `PlayerControl` | play/pause/seek/loop | planned |
+| `ResetDsp` | DSP 체인 초기화 | planned |
+| `Subscribe` | 스트림 구독 (meters, analysis, discord-pcm) | planned |
 
 ### 8.4 Engine → Agent Messages
 
-| Kind | Purpose |
-|------|---------|
-| `HelloAck` | 핸드셰이크 응답 (capabilities, sample rate) |
-| `Ack` | 명령 성공 |
-| `Nack` | 명령 거부 (코드 + 사유) |
-| `StateSnapshot` | 전체 엔진 상태 덤프 |
-| `MeterFrame` | RMS/peak/gain reduction (10-15 FPS) |
-| `AnalysisPcmChunk` | 분석용 PCM 청크 (100ms) |
-| `DiscordPcmFrame` | Discord 출력 프레임 (20ms, 3840 bytes) |
-| `CaptureStatus` | 캡처 상태 변경 알림 |
-| `XRunEvent` | 오디오 드롭아웃 알림 |
+| Kind | Purpose | Status |
+|------|---------|--------|
+| `HelloAck` | 핸드셰이크 응답 (capabilities, sample rate) | implemented |
+| `Ack` | 명령 성공 | implemented |
+| `Nack` | 명령 거부 (코드 + 사유) | implemented |
+| `StateSnapshot` | 전체 엔진 상태 덤프 | implemented |
+| `MeterFrame` | RMS/peak/gain reduction (10-15 FPS) | implemented |
+| `ChannelFeatures` / future `AnalysisPcmChunk` | 현재 Rust feature snapshot 또는 향후 PCM 분석 청크 (PR1은 아직 IPC 이벤트를 추가하지 않고 오디오 이해 스키마/오프라인 분석 기반만 정의) | planned |
+| `DiscordPcmFrame` | Discord 출력 프레임 (20ms, 3840 bytes) | planned |
+| `CaptureStatus` | 캡처 상태 변경 알림 | implemented |
+| `XRunEvent` | 오디오 드롭아웃 알림 | planned |
 
 ### 8.5 Reconnection
 
 - 하트비트: 매 1000ms
 - 3000ms 응답 없으면 stale
-- 재연결 시: Hello → HelloAck → Subscribe → StateSnapshot
+- 현재 재연결 시: Hello → HelloAck → StateSnapshot
+- 계획된 구독 재연결 흐름: Hello → HelloAck → Subscribe(when implemented) → StateSnapshot
 - 에이전트 연결 끊김 시: 오디오는 마지막 안전 상태로 계속 재생, 30초 후 생성 레이어 페이드아웃
 
 ---
@@ -817,6 +821,35 @@ type LlmContext = {
 
 ### 9.5 Analysis Pipeline
 
+Current foundation:
+
+```text
+Audio source / ChannelStrip
+  → mono f32 analysis tap
+  → FeatureAnalyzerHandle non-RT thread
+  → ChannelFeatures snapshots
+       ├─ dynamics: peak_db, rms_db, crest_factor, trend
+       ├─ spectrum: centroid, rolloff, flatness
+       ├─ rhythm texture: onset_rate_per_sec, zero_crossing_rate
+       └─ coarse labels: energy, brightness, texture
+```
+
+The asset-level Audio Understanding schema sits above raw feature frames:
+
+```text
+RawFeatureTimeline
+  → EvidenceMap keyed by evidence ids
+  → SemanticAudioUnderstanding
+       ├─ sections / flow summary
+       ├─ BPM, projected metrical beat/downbeat/bar/phrase markers with compact beat-grid summary/truncation metadata
+       ├─ mood / feel labels linked to evidence
+       └─ component estimates linked to evidence
+```
+
+Required boundary: the semantic object explains audio content and evolution only. It must not include DJ action recommendations, generated-code sketch hints, “best transition” choices, or unsupported subjective claims. Beat/downbeat/bar/phrase markers in PR1 are projected from the estimated beat interval; they are not yet structural downbeat/bar/phrase detections.
+
+Future richer analysis may add a PCM chunk router and JS/WASM processors:
+
 ```
 Engine AnalysisPcmChunk
   → chunk router (tap별 분배)
@@ -828,7 +861,7 @@ Engine AnalysisPcmChunk
   FeatureStore (rolling windows)
        │
        ↓
-  2s compact summary → LLM context
+  compact summary → LLM context
 ```
 
 **YAMNet 히스테리시스:**

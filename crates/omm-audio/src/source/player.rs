@@ -6,8 +6,8 @@ use rubato::{
 };
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{
-    CODEC_TYPE_NULL, CODEC_TYPE_PCM_F32LE, CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S24LE,
-    CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8, CodecParameters, CodecType, DecoderOptions,
+    CodecParameters, CodecType, DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_PCM_F32LE,
+    CODEC_TYPE_PCM_S16LE, CODEC_TYPE_PCM_S24LE, CODEC_TYPE_PCM_S32LE, CODEC_TYPE_PCM_U8,
 };
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
@@ -17,7 +17,7 @@ use symphonia::core::probe::Hint;
 use symphonia::default::{get_codecs, get_probe};
 
 use crate::dsp::SmoothedParam;
-use crate::frame::{StereoFrame, db_to_gain};
+use crate::frame::{db_to_gain, StereoFrame};
 use crate::source::AudioSource;
 
 const INTERNAL_CHANNELS: usize = 2;
