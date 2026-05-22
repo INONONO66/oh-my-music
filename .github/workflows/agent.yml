@@ -1,0 +1,26 @@
+name: Agent
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent.yml"
+  pull_request:
+    paths:
+      - "agent/**"
+      - ".github/workflows/agent.yml"
+
+jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install
+        working-directory: agent
+      - name: Typecheck
+        run: bun run typecheck
+        working-directory: agent
