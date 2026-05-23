@@ -348,28 +348,6 @@ mod tests {
             },
             RtCommand::SetMasterLowpassHz { hz: 18_000.0 },
             RtCommand::SetMasterHighpassHz { hz: 20.0 },
-            RtCommand::SetChannelGainDb {
-                source_id: SourceId::System,
-                db: -3.0,
-                ramp_frames: 9600,
-            },
-            RtCommand::SetChannelPan {
-                source_id: SourceId::Mic,
-                pan: -0.25,
-                ramp_frames: 9600,
-            },
-            RtCommand::SetChannelLowpassHz {
-                source_id: SourceId::Player,
-                hz: 12_000.0,
-            },
-            RtCommand::SetChannelHighpassHz {
-                source_id: SourceId::Glicol,
-                hz: 60.0,
-            },
-            RtCommand::SetChannelEnabled {
-                source_id: SourceId::System,
-                enabled: true,
-            },
             RtCommand::SetSourceInstanceEnabled {
                 source_instance_id: RtSourceInstanceId::new("file:loop"),
                 enabled: true,

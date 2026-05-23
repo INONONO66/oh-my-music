@@ -277,7 +277,6 @@ impl RtCommandScheduler {
 mod tests {
     use super::*;
     use crate::command::MAX_DRAIN_PER_BLOCK;
-    use omm_protocol::SourceId;
 
     const SAMPLE_RATE: u32 = 48_000;
 
@@ -286,8 +285,8 @@ mod tests {
             id,
             origin,
             trigger_frame,
-            RtCommand::SetChannelEnabled {
-                source_id: SourceId::Player,
+            RtCommand::SetSourceInstanceEnabled {
+                source_instance_id: crate::command::RtSourceInstanceId::new("player:main"),
                 enabled: false,
             },
         )

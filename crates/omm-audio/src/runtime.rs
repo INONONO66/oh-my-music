@@ -158,7 +158,8 @@ impl AudioRuntime {
         let capacity = analysis_ringbuf_capacity(self.sample_rate);
         let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
         strip.attach_analysis_producer(producer);
-        self.feature_registry.register_channel(source_id, consumer);
+        self.feature_registry
+            .register_channel(SourceInstanceId::legacy(source_id), consumer);
         self.channels.push(strip);
         Ok(())
     }
@@ -183,7 +184,7 @@ impl AudioRuntime {
         }
 
         let mut strip = ChannelStrip::new_timeline_source(
-            source_instance_id,
+            source_instance_id.clone(),
             source_kind,
             asset_ref,
             timeline,
@@ -191,8 +192,10 @@ impl AudioRuntime {
             self.sample_rate,
         );
         let capacity = analysis_ringbuf_capacity(self.sample_rate);
-        let (producer, _consumer) = HeapRb::<f32>::new(capacity).split();
+        let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
         strip.attach_analysis_producer(producer);
+        self.feature_registry
+            .register_channel(source_instance_id.clone(), consumer);
         self.channels.push(strip);
         Ok(())
     }
@@ -1090,13 +1093,46 @@ mod tests {
         }
     }
 
+    fn source_instance_for(source_id: SourceId) -> (SourceInstanceId, SourceKind) {
+        match source_id {
+            SourceId::System => (SourceInstanceId::new("system:main"), SourceKind::System),
+            SourceId::Mic => (SourceInstanceId::new("mic:default"), SourceKind::Mic),
+            SourceId::Player => (SourceInstanceId::new("player:main"), SourceKind::File),
+            SourceId::Glicol => (SourceInstanceId::new("glicol:main"), SourceKind::Generated),
+        }
+    }
+
+    fn source_asset_for(source_id: SourceId) -> Option<SourceAssetRef> {
+        match source_id {
+            SourceId::Glicol => Some(SourceAssetRef::Generated {
+                engine: omm_protocol::GeneratedEngine::Glicol,
+                code_ref: None,
+            }),
+            SourceId::Mic => Some(SourceAssetRef::LiveInput {
+                label: "microphone".to_string(),
+            }),
+            _ => None,
+        }
+    }
+
     fn add_test_channel(
         runtime: &mut AudioRuntime,
         source_id: SourceId,
         source: Box<dyn AudioSource>,
-    ) {
-        let result = runtime.add_channel(source_id, source);
-        assert!(result.is_ok(), "channel should be added: {result:?}");
+    ) -> SourceInstanceId {
+        let (source_instance_id, source_kind) = source_instance_for(source_id);
+        let result = runtime.add_source_instance(
+            source_instance_id.clone(),
+            source_kind,
+            source_asset_for(source_id),
+            SourceTimelinePlacement::always_on(),
+            source,
+        );
+        assert!(
+            result.is_ok(),
+            "source instance should be added: {result:?}"
+        );
+        source_instance_id
     }
 
     fn file_request(
@@ -1194,28 +1230,32 @@ mod tests {
     }
 
     #[test]
-    fn add_channel_duplicate_source_id_rejected() {
+    fn add_source_instance_duplicate_id_rejected() {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
 
-        let first = runtime.add_channel(
-            SourceId::System,
+        let first = runtime.add_source_instance(
+            SourceInstanceId::new("system:main"),
+            SourceKind::System,
+            None,
+            SourceTimelinePlacement::always_on(),
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
-        assert!(first.is_ok(), "first System channel should be accepted");
+        assert!(first.is_ok(), "first System source should be accepted");
 
-        let duplicate = runtime.add_channel(
-            SourceId::System,
+        let duplicate = runtime.add_source_instance(
+            SourceInstanceId::new("system:main"),
+            SourceKind::System,
+            None,
+            SourceTimelinePlacement::always_on(),
             Box::new(TestToneSource::new(880.0, SAMPLE_RATE)),
         );
 
-        assert_eq!(
+        assert!(matches!(
             duplicate,
-            Err(ChannelError::DuplicateSourceId {
-                source_id: SourceId::System
-            })
-        );
+            Err(SourceInstanceError::DuplicateSourceInstance { .. })
+        ));
     }
 
     #[test]
@@ -2027,8 +2067,8 @@ mod tests {
                 action_id: ScheduledActionId::new("mute-at-frame-256"),
                 origin: ActionOrigin::Test,
                 trigger_frame: 256,
-                command: RtCommand::SetChannelEnabled {
-                    source_id: SourceId::Player,
+                command: RtCommand::SetSourceInstanceEnabled {
+                    source_instance_id: RtSourceInstanceId::new("player:main"),
                     enabled: false,
                 },
             })
@@ -2107,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reports_legacy_channels_as_timeline_source_instances() {
+    fn runtime_reports_source_instances_in_timeline_snapshot() {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
@@ -2117,15 +2157,15 @@ mod tests {
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 db: -9.0,
                 ramp_frames: 0,
             })
             .is_ok());
         assert!(queue
-            .enqueue(RtCommand::SetChannelPan {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 pan: 0.5,
                 ramp_frames: 0,
             })
@@ -2139,12 +2179,12 @@ mod tests {
         assert_eq!(snapshot.sample_rate, SAMPLE_RATE);
         assert_eq!(snapshot.sources.len(), 1);
         let source = &snapshot.sources[0];
-        assert_eq!(source.source_instance_id.as_str(), "legacy:player");
+        assert_eq!(source.source_instance_id.as_str(), "player:main");
         assert_eq!(source.source_kind, SourceKind::File);
         assert_eq!(source.playback.state, PlaybackState::Playing);
         assert_eq!(source.effects.gain_db, -9.0);
         assert_eq!(source.effects.pan, 0.5);
-        assert_eq!(source.legacy_bridge.unwrap().source_id, SourceId::Player);
+        assert!(source.legacy_bridge.is_none());
         assert!(source.timeline.is_active_at(0));
     }
 
@@ -2234,8 +2274,8 @@ mod tests {
         );
 
         assert!(queue_att
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Glicol,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 db: -6.0,
                 ramp_frames: 0,
             })
@@ -2274,8 +2314,8 @@ mod tests {
         );
 
         assert!(queue_left
-            .enqueue(RtCommand::SetChannelPan {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 pan: -1.0,
                 ramp_frames: 0,
             })
@@ -2315,8 +2355,8 @@ mod tests {
         );
 
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Mic,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("mic:default"),
                 db: -60.0,
                 ramp_frames: 0,
             })
@@ -2352,7 +2392,7 @@ mod tests {
             .is_ok());
         assert!(queue
             .enqueue(RtCommand::SetSourceInstancePlaybackRate {
-                source_instance_id: RtSourceInstanceId::new("legacy:glicol"),
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 rate: 2.0,
                 ramp_frames: 0,
             })
@@ -2389,7 +2429,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let features = loop {
-            if let Some(features) = handle.poll_features(SourceId::Glicol) {
+            if let Some(features) = handle.poll_features(SourceInstanceId::new("glicol:main")) {
                 break features;
             }
             assert!(
@@ -2399,7 +2439,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        assert_eq!(features.source_id, SourceId::Glicol);
+        assert_eq!(features.source_instance_id.as_str(), "glicol:main");
         assert!(
             (900.0..=1_100.0).contains(&features.spectral_centroid_hz),
             "expected centroid ~1kHz, got {}",
@@ -2439,9 +2479,9 @@ mod tests {
         let mut player_features: Option<ChannelFeatures> = None;
         while glicol_features.is_none() || player_features.is_none() {
             for snapshot in handle.poll_all() {
-                match snapshot.source_id {
-                    SourceId::Glicol => glicol_features = Some(snapshot),
-                    SourceId::Player => player_features = Some(snapshot),
+                match snapshot.source_instance_id.as_str() {
+                    "glicol:main" => glicol_features = Some(snapshot),
+                    "player:main" => player_features = Some(snapshot),
                     _ => {}
                 }
             }
@@ -2546,8 +2586,8 @@ mod tests {
             .expect("c rate");
 
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Glicol,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 db: -3.0,
                 ramp_frames: 0,
             })
@@ -2622,7 +2662,7 @@ mod tests {
         let snap_glicol = snapshot
             .sources
             .iter()
-            .find(|s| s.legacy_bridge.map(|b| b.source_id) == Some(SourceId::Glicol))
+            .find(|s| s.source_instance_id.as_str() == "glicol:main")
             .expect("glicol in snapshot");
         assert!(
             (snap_glicol.effects.gain_db - -3.0).abs() < 0.001,
@@ -2687,8 +2727,8 @@ mod tests {
             })
             .is_ok());
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Glicol,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 db: -9.0,
                 ramp_frames: 0,
             })
@@ -2725,7 +2765,7 @@ mod tests {
         let snap_glicol = snapshot
             .sources
             .iter()
-            .find(|s| s.legacy_bridge.map(|b| b.source_id) == Some(SourceId::Glicol))
+            .find(|s| s.source_instance_id.as_str() == "glicol:main")
             .expect("glicol in snapshot");
         assert!(
             (snap_glicol.effects.gain_db - -9.0).abs() < 0.001,

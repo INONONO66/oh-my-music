@@ -377,8 +377,14 @@ mod tests {
     }
 
     fn render_sine(freq_hz: f32) -> ChannelStrip {
-        ChannelStrip::new(
-            SourceId::Glicol,
+        ChannelStrip::new_timeline_source(
+            SourceInstanceId::new("glicol:main"),
+            SourceKind::Generated,
+            Some(SourceAssetRef::Generated {
+                engine: omm_protocol::GeneratedEngine::Glicol,
+                code_ref: None,
+            }),
+            SourceTimelinePlacement::always_on(),
             Box::new(SineSource::new(freq_hz)),
             ENGINE_SAMPLE_RATE,
         )

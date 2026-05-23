@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use omm_protocol::params::SourceId;
+use omm_protocol::SourceInstanceId;
 use serde::{Deserialize, Serialize};
 
 use crate::features::analyzer::{compute_offline_channel_features, OfflineFeatureConfig};
@@ -275,7 +275,7 @@ impl OfflineAudioUnderstandingAnalyzer {
         let sample_rate = sample_rate.max(1);
         let duration_ms = samples.len() as u64 * 1_000 / sample_rate as u64;
         let channel_features = compute_offline_channel_features(
-            SourceId::Player,
+            SourceInstanceId::new("player:main"),
             samples,
             sample_rate,
             self.config.feature_config,

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::params::{ParamId, RtTarget, SourceId};
+use crate::params::{ParamId, RtTarget};
 use crate::source_timeline::SourceTimelineSnapshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,7 +49,7 @@ pub enum EngineCommand {
         reason: String,
     },
     SetSourceMute {
-        source: SourceId,
+        source_instance_id: String,
         muted: bool,
         ramp_ms: u32,
     },

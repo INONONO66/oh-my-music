@@ -3,9 +3,13 @@ use std::time::Duration;
 
 use cpal::traits::StreamTrait;
 use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource, TestToneSource};
-use omm_audio::{run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand};
+use omm_audio::{
+    run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand, RtSourceInstanceId,
+};
 use omm_engine::cpal_io::CpalIo;
-use omm_protocol::SourceId;
+use omm_protocol::{
+    GeneratedEngine, SourceAssetRef, SourceInstanceId, SourceKind, SourceTimelinePlacement,
+};
 use ringbuf::traits::Consumer;
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -18,6 +22,10 @@ const MIC_MONITOR_GAIN_DB: f32 = 18.0;
 const MULTI_DEMO_DURATION_SECS: u64 = 10;
 const MULTI_DEMO_RAMP_FRAMES: u32 = 9_600;
 const MIX_DEMO_GLICOL_CODE: &str = "out: sin 110 >> mul 0.1";
+const GLICOL_INSTANCE_ID: &str = "glicol:main";
+const PLAYER_INSTANCE_ID: &str = "player:main";
+const SYSTEM_INSTANCE_ID: &str = "system:main";
+const MIC_INSTANCE_ID: &str = "mic:default";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -85,7 +93,7 @@ async fn run_test_tone() -> anyhow::Result<()> {
         sample_rate: SAMPLE_RATE,
     });
     let source = Box::new(MusicalTestSource::new(SAMPLE_RATE));
-    runtime.add_channel(SourceId::Glicol, source)?;
+    add_glicol_source(&mut runtime, source)?;
 
     let _io = CpalIo::new(runtime, None)?;
     println!("Audio stream started. Press Ctrl-C to stop.");
@@ -115,7 +123,7 @@ async fn run_glicol(code: &str) -> anyhow::Result<()> {
     }
     println!("Glicol code loaded successfully.");
 
-    runtime.add_channel(SourceId::Glicol, Box::new(source))?;
+    add_glicol_source(&mut runtime, Box::new(source))?;
     let _io = CpalIo::new(runtime, None)?;
     println!("Audio stream started. Press Ctrl-C to stop.");
 
@@ -138,27 +146,24 @@ async fn run_mix_demo() -> anyhow::Result<()> {
         eprintln!("Glicol code load failed: {err}");
         std::process::exit(1);
     }
-    runtime.add_channel(SourceId::Glicol, Box::new(glicol))?;
+    add_glicol_source(&mut runtime, Box::new(glicol))?;
 
-    runtime.add_channel(
-        SourceId::Player,
-        Box::new(MusicalTestSource::new(SAMPLE_RATE)),
-    )?;
+    add_player_source(&mut runtime, Box::new(MusicalTestSource::new(SAMPLE_RATE)))?;
 
     if mic_stream.is_some() {
-        let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-            source_id: SourceId::Mic,
+        let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+            source_instance_id: RtSourceInstanceId::new(MIC_INSTANCE_ID),
             db: -3.0,
             ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
         });
     }
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Glicol,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
         db: -6.0,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Player,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
         db: -6.0,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
@@ -202,6 +207,51 @@ fn run_timeline_demo() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn add_glicol_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(GLICOL_INSTANCE_ID),
+        SourceKind::Generated,
+        Some(SourceAssetRef::Generated {
+            engine: GeneratedEngine::Glicol,
+            code_ref: None,
+        }),
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
+fn add_player_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(PLAYER_INSTANCE_ID),
+        SourceKind::File,
+        None,
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
+fn add_system_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(SYSTEM_INSTANCE_ID),
+        SourceKind::System,
+        None,
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
 async fn run_multi_demo() -> anyhow::Result<()> {
     println!("multi-demo: 3 sources + Glicol, individual effects, {MULTI_DEMO_DURATION_SECS}s");
 
@@ -211,47 +261,44 @@ async fn run_multi_demo() -> anyhow::Result<()> {
 
     let mut glicol = GlicolSource::new(SAMPLE_RATE);
     glicol.load_code("out: saw 55 >> lpf 800 0.5 >> mul 0.15")?;
-    runtime.add_channel(SourceId::Glicol, Box::new(glicol))?;
+    add_glicol_source(&mut runtime, Box::new(glicol))?;
 
-    runtime.add_channel(
-        SourceId::Player,
-        Box::new(MusicalTestSource::new(SAMPLE_RATE)),
-    )?;
+    add_player_source(&mut runtime, Box::new(MusicalTestSource::new(SAMPLE_RATE)))?;
 
-    runtime.add_channel(
-        SourceId::System,
+    add_system_source(
+        &mut runtime,
         Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
     )?;
 
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Glicol,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
         db: -3.0,
         ramp_frames: 0,
     });
-    let _ = command_queue.enqueue(RtCommand::SetChannelPan {
-        source_id: SourceId::Glicol,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
         pan: -0.7,
         ramp_frames: 0,
     });
 
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Player,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
         db: -6.0,
         ramp_frames: 0,
     });
-    let _ = command_queue.enqueue(RtCommand::SetChannelPan {
-        source_id: SourceId::Player,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
         pan: 0.7,
         ramp_frames: 0,
     });
 
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::System,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
         db: -12.0,
         ramp_frames: 0,
     });
-    let _ = command_queue.enqueue(RtCommand::SetChannelHighpassHz {
-        source_id: SourceId::System,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceHighpassHz {
+        source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
         hz: 300.0,
     });
 
@@ -285,23 +332,23 @@ async fn run_multi_demo() -> anyhow::Result<()> {
                 effects_shifted = true;
                 println!("  -- shifting effects at {:.0}s --", half.as_secs_f32());
 
-                let _ = command_queue.enqueue(RtCommand::SetChannelPan {
-                    source_id: SourceId::Glicol,
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
                     pan: 0.7,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
-                let _ = command_queue.enqueue(RtCommand::SetChannelPan {
-                    source_id: SourceId::Player,
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
                     pan: -0.7,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
-                let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-                    source_id: SourceId::System,
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
                     db: -6.0,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
-                let _ = command_queue.enqueue(RtCommand::SetChannelLowpassHz {
-                    source_id: SourceId::System,
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceLowpassHz {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
                     hz: 2_000.0,
                 });
 
@@ -363,8 +410,8 @@ async fn run_mic_monitor() -> anyhow::Result<()> {
         anyhow::bail!("microphone is unavailable");
     }
 
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Mic,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(MIC_INSTANCE_ID),
         db: MIC_MONITOR_GAIN_DB,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
@@ -411,7 +458,15 @@ fn build_mic_channel(runtime: &mut AudioRuntime) -> Option<cpal::Stream> {
         }
     };
 
-    if let Err(err) = runtime.add_channel(SourceId::Mic, Box::new(mic)) {
+    if let Err(err) = runtime.add_source_instance(
+        SourceInstanceId::new(MIC_INSTANCE_ID),
+        SourceKind::Mic,
+        Some(SourceAssetRef::LiveInput {
+            label: "microphone".to_string(),
+        }),
+        SourceTimelinePlacement::always_on(),
+        Box::new(mic),
+    ) {
         eprintln!("Failed to attach mic channel; continuing without mic: {err}");
         return None;
     }

@@ -8,10 +8,10 @@ pub enum SourceId {
     Glicol,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum RtTarget {
     Master,
-    Source(SourceId),
+    Source(String),
     Bus(BusId),
 }
 
