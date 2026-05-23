@@ -2424,4 +2424,253 @@ mod tests {
             "expected handle drop to join analyzer thread quickly, took {elapsed:?}"
         );
     }
+
+    #[test]
+    fn multi_file_instances_with_individual_effects_and_glicol() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+
+        let file_a_id = SourceInstanceId::new("file:track-a");
+        let file_b_id = SourceInstanceId::new("file:track-b");
+        let file_c_id = SourceInstanceId::new("file:track-c");
+
+        let wav_a = sine_wav(4_800, 440.0);
+        let wav_b = sine_wav(4_800, 880.0);
+        let wav_c = sine_wav(4_800, 220.0);
+
+        runtime
+            .add_file_source_instance(file_request(file_a_id.as_str(), "mem://a.wav", &wav_a, 0))
+            .expect("file-a accepted");
+        runtime
+            .add_file_source_instance(file_request(file_b_id.as_str(), "mem://b.wav", &wav_b, 0))
+            .expect("file-b accepted");
+        runtime
+            .add_file_source_instance(file_request(file_c_id.as_str(), "mem://c.wav", &wav_c, 0))
+            .expect("file-c accepted");
+
+        let mut glicol = GlicolSource::new(SAMPLE_RATE);
+        glicol
+            .load_code("out: sin 660 >> mul 0.2")
+            .expect("glicol code loaded");
+        add_test_channel(&mut runtime, SourceId::Glicol, Box::new(glicol));
+
+        runtime
+            .set_source_instance_gain_db(&file_a_id, -6.0, 0)
+            .expect("a gain");
+        runtime
+            .set_source_instance_pan(&file_a_id, -1.0, 0)
+            .expect("a pan");
+        runtime
+            .set_source_instance_highpass_hz(&file_a_id, 200.0)
+            .expect("a highpass");
+
+        runtime
+            .set_source_instance_pan(&file_b_id, 1.0, 0)
+            .expect("b pan");
+        runtime
+            .set_source_instance_eq_gains_db(&file_b_id, 6.0, 0.0, -3.0, 0)
+            .expect("b eq");
+        runtime
+            .set_source_instance_lowpass_hz(&file_b_id, 5_000.0)
+            .expect("b lowpass");
+
+        runtime
+            .set_source_instance_reverb_send_db(&file_c_id, 0.0, 0)
+            .expect("c reverb");
+        runtime
+            .set_source_instance_playback_rate(&file_c_id, 2.0, 0)
+            .expect("c rate");
+
+        assert!(queue
+            .enqueue(RtCommand::SetChannelGainDb {
+                source_id: SourceId::Glicol,
+                db: -3.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let blocks = 4;
+        let block_size = 256;
+        let mut output = vec![StereoFrame::SILENCE; block_size];
+        for _ in 0..blocks {
+            runtime.render_block(&mut output);
+        }
+
+        for (idx, frame) in output.iter().enumerate() {
+            assert!(
+                frame.left.is_finite(),
+                "left NaN/Inf at frame {idx}: {}",
+                frame.left
+            );
+            assert!(
+                frame.right.is_finite(),
+                "right NaN/Inf at frame {idx}: {}",
+                frame.right
+            );
+            assert!(
+                frame.left >= -1.0 && frame.left <= 1.0,
+                "left out of [-1,1] at frame {idx}: {}",
+                frame.left
+            );
+            assert!(
+                frame.right >= -1.0 && frame.right <= 1.0,
+                "right out of [-1,1] at frame {idx}: {}",
+                frame.right
+            );
+        }
+
+        let mixed_peak = peak(&output);
+        assert!(
+            mixed_peak > 0.05,
+            "4-source mix should be audible, got peak {mixed_peak}"
+        );
+
+        let snapshot = runtime.source_timeline_snapshot();
+
+        let snap_a = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_a_id)
+            .expect("file-a in snapshot");
+        assert_eq!(snap_a.effects.gain_db, -6.0);
+        assert_eq!(snap_a.effects.pan, -1.0);
+        assert_eq!(snap_a.effects.highpass_hz, 200.0);
+
+        let snap_b = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_b_id)
+            .expect("file-b in snapshot");
+        assert_eq!(snap_b.effects.pan, 1.0);
+        assert_eq!(snap_b.effects.eq.low_gain_db, 6.0);
+        assert_eq!(snap_b.effects.eq.mid_gain_db, 0.0);
+        assert_eq!(snap_b.effects.eq.high_gain_db, -3.0);
+        assert_eq!(snap_b.effects.lowpass_hz, 5_000.0);
+
+        let snap_c = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_c_id)
+            .expect("file-c in snapshot");
+        assert_eq!(snap_c.effects.reverb_send_db, 0.0);
+        assert_eq!(snap_c.effects.playback_rate, 2.0);
+
+        let snap_glicol = snapshot
+            .sources
+            .iter()
+            .find(|s| s.legacy_bridge.map(|b| b.source_id) == Some(SourceId::Glicol))
+            .expect("glicol in snapshot");
+        assert!(
+            (snap_glicol.effects.gain_db - -3.0).abs() < 0.001,
+            "glicol gain should be -3 dB, got {}",
+            snap_glicol.effects.gain_db
+        );
+
+        assert_eq!(snapshot.sources.len(), 4);
+    }
+
+    #[test]
+    fn multi_source_rt_effect_changes_apply_independently() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+
+        let id_a = SourceInstanceId::new("file:rt-a");
+        let id_b = SourceInstanceId::new("file:rt-b");
+        let wav = sine_wav(4_800, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id_a.as_str(), "mem://rt-a.wav", &wav, 0))
+            .expect("rt-a accepted");
+        runtime
+            .add_file_source_instance(file_request(id_b.as_str(), "mem://rt-b.wav", &wav, 0))
+            .expect("rt-b accepted");
+
+        let mut glicol = GlicolSource::new(SAMPLE_RATE);
+        glicol
+            .load_code("out: sin 330 >> mul 0.15")
+            .expect("glicol loaded");
+        add_test_channel(&mut runtime, SourceId::Glicol, Box::new(glicol));
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new(id_a.as_str()),
+                db: -12.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new(id_a.as_str()),
+                pan: -1.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceEq {
+                source_instance_id: RtSourceInstanceId::new(id_b.as_str()),
+                low_db: 6.0,
+                mid_db: -6.0,
+                high_db: 3.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id: RtSourceInstanceId::new(id_b.as_str()),
+                send_db: -6.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetChannelGainDb {
+                source_id: SourceId::Glicol,
+                db: -9.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+
+        let snap_a = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == id_a)
+            .expect("rt-a in snapshot");
+        assert_eq!(snap_a.effects.gain_db, -12.0);
+        assert_eq!(snap_a.effects.pan, -1.0);
+        assert_eq!(snap_a.effects.eq.low_gain_db, 0.0);
+        assert_eq!(snap_a.effects.eq.mid_gain_db, 0.0);
+        assert_eq!(snap_a.effects.eq.high_gain_db, 0.0);
+
+        let snap_b = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == id_b)
+            .expect("rt-b in snapshot");
+        assert_eq!(snap_b.effects.gain_db, 0.0);
+        assert_eq!(snap_b.effects.pan, 0.0);
+        assert_eq!(snap_b.effects.eq.low_gain_db, 6.0);
+        assert_eq!(snap_b.effects.eq.mid_gain_db, -6.0);
+        assert_eq!(snap_b.effects.eq.high_gain_db, 3.0);
+        assert_eq!(snap_b.effects.reverb_send_db, -6.0);
+
+        let snap_glicol = snapshot
+            .sources
+            .iter()
+            .find(|s| s.legacy_bridge.map(|b| b.source_id) == Some(SourceId::Glicol))
+            .expect("glicol in snapshot");
+        assert!(
+            (snap_glicol.effects.gain_db - -9.0).abs() < 0.001,
+            "glicol gain should be -9 dB, got {}",
+            snap_glicol.effects.gain_db
+        );
+
+        assert_all_in_unit_range(&output);
+        assert!(peak(&output) > 0.01, "mixed output should be non-silent");
+    }
 }

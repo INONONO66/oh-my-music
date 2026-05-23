@@ -2,7 +2,7 @@ use std::env;
 use std::time::Duration;
 
 use cpal::traits::StreamTrait;
-use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource};
+use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource, TestToneSource};
 use omm_audio::{run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand};
 use omm_engine::cpal_io::CpalIo;
 use omm_protocol::SourceId;
@@ -15,6 +15,8 @@ const MIC_TEST_DURATION_SECS: u64 = 3;
 const FEATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MIX_DEMO_GAIN_RAMP_FRAMES: u32 = 4_800;
 const MIC_MONITOR_GAIN_DB: f32 = 18.0;
+const MULTI_DEMO_DURATION_SECS: u64 = 10;
+const MULTI_DEMO_RAMP_FRAMES: u32 = 9_600;
 const MIX_DEMO_GLICOL_CODE: &str = "out: sin 110 >> mul 0.1";
 
 #[tokio::main]
@@ -37,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
             run_glicol(&args[2]).await?;
         }
         "mix-demo" => run_mix_demo().await?,
+        "multi-demo" => run_multi_demo().await?,
         "timeline-demo" => run_timeline_demo()?,
         "mic-test" => run_mic_test().await?,
         "mic-monitor" => run_mic_monitor().await?,
@@ -60,6 +63,7 @@ fn usage_text() -> String {
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"<glicol code>\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine multi-demo\n");
     text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n\n");
     text.push_str("  omm-engine mic-monitor\n\n");
@@ -67,6 +71,7 @@ fn usage_text() -> String {
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"out: sin 440 >> mul 0.1\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine multi-demo\n");
     text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n");
     text.push_str("  omm-engine mic-monitor\n");
@@ -195,6 +200,117 @@ fn run_timeline_demo() -> anyhow::Result<()> {
     let report = run_timeline_dj_demo(Default::default())?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+async fn run_multi_demo() -> anyhow::Result<()> {
+    println!("multi-demo: 3 sources + Glicol, individual effects, {MULTI_DEMO_DURATION_SECS}s");
+
+    let (mut runtime, mut command_queue, _features) = AudioRuntime::new(AudioRuntimeConfig {
+        sample_rate: SAMPLE_RATE,
+    });
+
+    let mut glicol = GlicolSource::new(SAMPLE_RATE);
+    glicol.load_code("out: saw 55 >> lpf 800 0.5 >> mul 0.15")?;
+    runtime.add_channel(SourceId::Glicol, Box::new(glicol))?;
+
+    runtime.add_channel(
+        SourceId::Player,
+        Box::new(MusicalTestSource::new(SAMPLE_RATE)),
+    )?;
+
+    runtime.add_channel(
+        SourceId::System,
+        Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+    )?;
+
+    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
+        source_id: SourceId::Glicol,
+        db: -3.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetChannelPan {
+        source_id: SourceId::Glicol,
+        pan: -0.7,
+        ramp_frames: 0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
+        source_id: SourceId::Player,
+        db: -6.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetChannelPan {
+        source_id: SourceId::Player,
+        pan: 0.7,
+        ramp_frames: 0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
+        source_id: SourceId::System,
+        db: -12.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetChannelHighpassHz {
+        source_id: SourceId::System,
+        hz: 300.0,
+    });
+
+    let _io = CpalIo::new(runtime, None)?;
+    println!("  Glicol (saw 55 Hz, LPF 800): left, -3 dB");
+    println!("  MusicalTest pattern:          right, -6 dB");
+    println!("  TestTone 440 Hz:              center, -12 dB, HPF 300");
+    println!("Playing... press Ctrl-C to stop early.");
+
+    let half = Duration::from_secs(MULTI_DEMO_DURATION_SECS / 2);
+    let total = Duration::from_secs(MULTI_DEMO_DURATION_SECS);
+    let deadline = tokio::time::sleep(total);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(deadline);
+    tokio::pin!(ctrl_c);
+
+    let mut effects_shifted = false;
+    let shift_at = tokio::time::Instant::now() + half;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                println!("{MULTI_DEMO_DURATION_SECS}s elapsed, stopping.");
+                return Ok(());
+            }
+            _ = &mut ctrl_c => {
+                println!("Ctrl-C, stopping.");
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(shift_at), if !effects_shifted => {
+                effects_shifted = true;
+                println!("  -- shifting effects at {:.0}s --", half.as_secs_f32());
+
+                let _ = command_queue.enqueue(RtCommand::SetChannelPan {
+                    source_id: SourceId::Glicol,
+                    pan: 0.7,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetChannelPan {
+                    source_id: SourceId::Player,
+                    pan: -0.7,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
+                    source_id: SourceId::System,
+                    db: -6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetChannelLowpassHz {
+                    source_id: SourceId::System,
+                    hz: 2_000.0,
+                });
+
+                println!("  Glicol:       pan -0.7 -> +0.7");
+                println!("  MusicalTest:  pan +0.7 -> -0.7");
+                println!("  TestTone:     -12 dB -> -6 dB, LPF 2kHz added");
+            }
+        }
+    }
 }
 
 async fn run_mic_test() -> anyhow::Result<()> {
@@ -333,6 +449,10 @@ mod tests {
             "usage missing timeline-demo: {text}"
         );
         assert!(text.contains("mic-test"), "usage missing mic-test: {text}");
+        assert!(
+            text.contains("multi-demo"),
+            "usage missing multi-demo: {text}"
+        );
         assert!(
             text.contains("mic-monitor"),
             "usage missing mic-monitor: {text}"
