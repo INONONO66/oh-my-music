@@ -99,23 +99,120 @@ impl ThreeBandEq {
     }
 }
 
+struct DelayLine {
+    buffer: Vec<f32>,
+    index: usize,
+}
+
+impl DelayLine {
+    fn new(len: usize) -> Self {
+        Self {
+            buffer: vec![0.0; len.max(1)],
+            index: 0,
+        }
+    }
+
+    fn read(&self) -> f32 {
+        self.buffer[self.index]
+    }
+
+    fn write_and_advance(&mut self, value: f32) {
+        self.buffer[self.index] = value;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+    }
+}
+
+struct CombFilter {
+    delay: DelayLine,
+    feedback: f32,
+    damp_state: f32,
+    damp_alpha: f32,
+}
+
+impl CombFilter {
+    fn new(delay_samples: usize, feedback: f32, damp_alpha: f32) -> Self {
+        Self {
+            delay: DelayLine::new(delay_samples),
+            feedback,
+            damp_state: 0.0,
+            damp_alpha,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let delayed = self.delay.read();
+        self.damp_state += self.damp_alpha * (delayed - self.damp_state);
+        self.delay
+            .write_and_advance(input + self.damp_state * self.feedback);
+        delayed
+    }
+}
+
+struct AllpassFilter {
+    delay: DelayLine,
+    coeff: f32,
+}
+
+impl AllpassFilter {
+    fn new(delay_samples: usize, coeff: f32) -> Self {
+        Self {
+            delay: DelayLine::new(delay_samples),
+            coeff,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let delayed = self.delay.read();
+        let y = delayed - self.coeff * input;
+        self.delay.write_and_advance(input + self.coeff * y);
+        y
+    }
+}
+
+const DAMP_ALPHA: f32 = 0.5440619;
+const COMB_SCALE: f32 = 0.25;
+const RETURN_TRIM: f32 = 0.35;
+
+const LEFT_PREDELAY: usize = 467;
+const RIGHT_PREDELAY: usize = 523;
+const LEFT_COMB_DELAYS: [(usize, f32); 4] = [
+    (1499, 0.7500),
+    (1601, 0.7355),
+    (1747, 0.7152),
+    (1871, 0.6984),
+];
+const RIGHT_COMB_DELAYS: [(usize, f32); 4] = [
+    (1559, 0.7415),
+    (1663, 0.7268),
+    (1789, 0.7094),
+    (1999, 0.6814),
+];
+const LEFT_AP_DELAYS: [(usize, f32); 2] = [(431, 0.5), (563, 0.5)];
+const RIGHT_AP_DELAYS: [(usize, f32); 2] = [(443, 0.5), (593, 0.5)];
+
 pub struct SimpleReverb {
     send_db: SmoothedParam,
-    left_delay: Vec<f32>,
-    right_delay: Vec<f32>,
-    write_index: usize,
-    feedback: f32,
+    left_predelay: DelayLine,
+    right_predelay: DelayLine,
+    left_combs: [CombFilter; 4],
+    right_combs: [CombFilter; 4],
+    left_allpasses: [AllpassFilter; 2],
+    right_allpasses: [AllpassFilter; 2],
 }
 
 impl SimpleReverb {
-    pub fn new(sample_rate: u32) -> Self {
-        let delay_frames = ((sample_rate as usize) / 750).clamp(1, 512);
+    pub fn new(_sample_rate: u32) -> Self {
         Self {
             send_db: SmoothedParam::new(-60.0),
-            left_delay: vec![0.0; delay_frames],
-            right_delay: vec![0.0; delay_frames],
-            write_index: 0,
-            feedback: 0.38,
+            left_predelay: DelayLine::new(LEFT_PREDELAY),
+            right_predelay: DelayLine::new(RIGHT_PREDELAY),
+            left_combs: LEFT_COMB_DELAYS.map(|(len, fb)| CombFilter::new(len, fb, DAMP_ALPHA)),
+            right_combs: RIGHT_COMB_DELAYS.map(|(len, fb)| CombFilter::new(len, fb, DAMP_ALPHA)),
+            left_allpasses: LEFT_AP_DELAYS.map(|(len, c)| AllpassFilter::new(len, c)),
+            right_allpasses: RIGHT_AP_DELAYS.map(|(len, c)| AllpassFilter::new(len, c)),
         }
     }
 
@@ -128,30 +225,41 @@ impl SimpleReverb {
     }
 
     pub fn process(&mut self, frames: &mut [StereoFrame]) {
-        if self.left_delay.is_empty() {
-            return;
-        }
-
         for frame in frames {
-            let delayed_left = self.left_delay[self.write_index];
-            let delayed_right = self.right_delay[self.write_index];
             let send_db = self.send_db.next_value();
-            let send = if send_db <= -60.0 {
+            let send_gain = if send_db <= -60.0 {
                 0.0
             } else {
-                db_to_gain(send_db)
+                db_to_gain(send_db * 0.5)
             };
 
-            self.left_delay[self.write_index] = frame.left * send + delayed_left * self.feedback;
-            self.right_delay[self.write_index] = frame.right * send + delayed_right * self.feedback;
+            let left_in = self.left_predelay.read();
+            self.left_predelay.write_and_advance(frame.left * send_gain);
+            let right_in = self.right_predelay.read();
+            self.right_predelay
+                .write_and_advance(frame.right * send_gain);
 
-            frame.left += delayed_left * send;
-            frame.right += delayed_right * send;
-
-            self.write_index += 1;
-            if self.write_index >= self.left_delay.len() {
-                self.write_index = 0;
+            let mut left_sum = 0.0_f32;
+            for comb in &mut self.left_combs {
+                left_sum += comb.process(left_in);
             }
+            left_sum *= COMB_SCALE;
+
+            let mut right_sum = 0.0_f32;
+            for comb in &mut self.right_combs {
+                right_sum += comb.process(right_in);
+            }
+            right_sum *= COMB_SCALE;
+
+            for ap in &mut self.left_allpasses {
+                left_sum = ap.process(left_sum);
+            }
+            for ap in &mut self.right_allpasses {
+                right_sum = ap.process(right_sum);
+            }
+
+            frame.left += left_sum * RETURN_TRIM * send_gain;
+            frame.right += right_sum * RETURN_TRIM * send_gain;
         }
     }
 }
@@ -198,30 +306,60 @@ mod tests {
     fn simple_reverb_creates_delayed_tail() {
         let mut reverb = SimpleReverb::new(48_000);
         reverb.set_send_db(0.0, 0);
-        let mut frames = vec![StereoFrame::SILENCE; 128];
-        frames[0] = StereoFrame::new(1.0, 1.0);
 
+        let mut frames = vec![StereoFrame::SILENCE; 4096];
+        frames[0] = StereoFrame::new(1.0, 1.0);
         reverb.process(&mut frames);
 
+        let tail_energy: f32 = frames[LEFT_PREDELAY + 100..]
+            .iter()
+            .map(|f| f.left * f.left + f.right * f.right)
+            .sum();
         assert!(
-            frames.iter().skip(1).any(|frame| frame.left.abs() > 0.1),
-            "reverb should feed delayed energy back into the source block"
+            tail_energy > 0.01,
+            "reverb should produce audible tail after predelay + comb, got energy {tail_energy}"
         );
     }
 
     #[test]
     fn reverb_send_does_not_capture_audio_while_muted() {
         let mut reverb = SimpleReverb::new(48_000);
-        let mut muted_frames = vec![StereoFrame::new(1.0, 1.0); 128];
+        let mut muted_frames = vec![StereoFrame::new(1.0, 1.0); 4096];
         reverb.process(&mut muted_frames);
 
         reverb.set_send_db(0.0, 0);
-        let mut tail = vec![StereoFrame::SILENCE; 128];
+        let mut tail = vec![StereoFrame::SILENCE; 4096];
         reverb.process(&mut tail);
 
+        let tail_energy: f32 = tail
+            .iter()
+            .map(|f| f.left * f.left + f.right * f.right)
+            .sum();
         assert!(
-            tail.iter().all(|frame| frame.left.abs() < 0.000001),
-            "muted send should not preload stale reverb energy"
+            tail_energy < 0.001,
+            "muted send should not preload stale reverb energy, got {tail_energy}"
+        );
+    }
+
+    #[test]
+    fn reverb_stereo_spread_differs_between_channels() {
+        let mut reverb = SimpleReverb::new(48_000);
+        reverb.set_send_db(0.0, 0);
+
+        let mut frames = vec![StereoFrame::SILENCE; 4096];
+        frames[0] = StereoFrame::new(1.0, 1.0);
+        reverb.process(&mut frames);
+
+        let mut left_differs = false;
+        for frame in &frames[LEFT_PREDELAY..] {
+            if (frame.left - frame.right).abs() > 0.001 {
+                left_differs = true;
+                break;
+            }
+        }
+        assert!(
+            left_differs,
+            "L/R delay lines differ so identical input should produce stereo spread"
         );
     }
 }

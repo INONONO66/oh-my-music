@@ -19,7 +19,7 @@ const MIC_TEST_DURATION_SECS: u64 = 3;
 const FEATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MIX_DEMO_GAIN_RAMP_FRAMES: u32 = 4_800;
 const MIC_MONITOR_GAIN_DB: f32 = 18.0;
-const MULTI_DEMO_DURATION_SECS: u64 = 10;
+const MULTI_DEMO_DURATION_SECS: u64 = 15;
 const MULTI_DEMO_RAMP_FRAMES: u32 = 9_600;
 const MIX_DEMO_GLICOL_CODE: &str = "out: sin 110 >> mul 0.1";
 const GLICOL_INSTANCE_ID: &str = "glicol:main";
@@ -302,21 +302,37 @@ async fn run_multi_demo() -> anyhow::Result<()> {
         hz: 300.0,
     });
 
-    let _io = CpalIo::new(runtime, None)?;
-    println!("  Glicol (saw 55 Hz, LPF 800): left, -3 dB");
-    println!("  MusicalTest pattern:          right, -6 dB");
-    println!("  TestTone 440 Hz:              center, -12 dB, HPF 300");
-    println!("Playing... press Ctrl-C to stop early.");
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+        low_db: 4.0,
+        mid_db: 0.0,
+        high_db: -2.0,
+        ramp_frames: 0,
+    });
 
-    let half = Duration::from_secs(MULTI_DEMO_DURATION_SECS / 2);
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+        send_db: -6.0,
+        ramp_frames: 0,
+    });
+
+    let _io = CpalIo::new(runtime, None)?;
+    println!("  Glicol (saw 55 Hz, LPF 800): left, -3 dB, reverb -6 dB");
+    println!("  MusicalTest pattern:          right, -6 dB, EQ low+4/high-2");
+    println!("  TestTone 440 Hz:              center, -12 dB, HPF 300");
+    println!("Playing 15s... press Ctrl-C to stop early.");
+    println!();
+
     let total = Duration::from_secs(MULTI_DEMO_DURATION_SECS);
+    let phase2_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let phase3_at = tokio::time::Instant::now() + Duration::from_secs(10);
     let deadline = tokio::time::sleep(total);
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(deadline);
     tokio::pin!(ctrl_c);
 
-    let mut effects_shifted = false;
-    let shift_at = tokio::time::Instant::now() + half;
+    let mut phase2_done = false;
+    let mut phase3_done = false;
 
     loop {
         tokio::select! {
@@ -328,13 +344,25 @@ async fn run_multi_demo() -> anyhow::Result<()> {
                 println!("Ctrl-C, stopping.");
                 return Ok(());
             }
-            _ = tokio::time::sleep_until(shift_at), if !effects_shifted => {
-                effects_shifted = true;
-                println!("  -- shifting effects at {:.0}s --", half.as_secs_f32());
+            _ = tokio::time::sleep_until(phase2_at), if !phase2_done => {
+                phase2_done = true;
+                println!("  -- 5s: reverb up, EQ shift, pan swap --");
 
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    send_db: 0.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
                 let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
                     source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
                     pan: 0.7,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    low_db: -6.0,
+                    mid_db: 6.0,
+                    high_db: 4.0,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
                 let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
@@ -342,19 +370,53 @@ async fn run_multi_demo() -> anyhow::Result<()> {
                     pan: -0.7,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    send_db: -3.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
                 let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
                     source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
                     db: -6.0,
                     ramp_frames: MULTI_DEMO_RAMP_FRAMES,
                 });
+            }
+            _ = tokio::time::sleep_until(phase3_at), if !phase3_done => {
+                phase3_done = true;
+                println!("  -- 10s: heavy reverb, EQ kill bass, LPF down --");
+
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    send_db: 6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    low_db: -12.0,
+                    mid_db: 0.0,
+                    high_db: 6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceLowpassHz {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    hz: 800.0,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    send_db: 0.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
                 let _ = command_queue.enqueue(RtCommand::SetSourceInstanceLowpassHz {
                     source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
-                    hz: 2_000.0,
+                    hz: 1_000.0,
                 });
-
-                println!("  Glicol:       pan -0.7 -> +0.7");
-                println!("  MusicalTest:  pan +0.7 -> -0.7");
-                println!("  TestTone:     -12 dB -> -6 dB, LPF 2kHz added");
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    low_db: 6.0,
+                    mid_db: -6.0,
+                    high_db: -12.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
             }
         }
     }
