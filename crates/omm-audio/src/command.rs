@@ -93,6 +93,10 @@ pub enum RtCommand {
         source_id: SourceId,
         enabled: bool,
     },
+    SetSourceInstanceEnabled {
+        source_instance_id: RtSourceInstanceId,
+        enabled: bool,
+    },
     SetSourceInstanceGainDb {
         source_instance_id: RtSourceInstanceId,
         db: f32,
@@ -321,6 +325,7 @@ mod tests {
                 | RtCommand::SetChannelLowpassHz { .. }
                 | RtCommand::SetChannelHighpassHz { .. }
                 | RtCommand::SetChannelEnabled { .. }
+                | RtCommand::SetSourceInstanceEnabled { .. }
                 | RtCommand::SetSourceInstanceGainDb { .. }
                 | RtCommand::SetSourceInstancePan { .. }
                 | RtCommand::SetSourceInstanceHighpassHz { .. }
@@ -363,6 +368,10 @@ mod tests {
             },
             RtCommand::SetChannelEnabled {
                 source_id: SourceId::System,
+                enabled: true,
+            },
+            RtCommand::SetSourceInstanceEnabled {
+                source_instance_id: RtSourceInstanceId::new("file:loop"),
                 enabled: true,
             },
             RtCommand::SetSourceInstanceGainDb {

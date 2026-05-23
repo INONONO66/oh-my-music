@@ -120,6 +120,12 @@ pub struct SourceTimelinePlacement {
 }
 
 impl SourceTimelinePlacement {
+    pub fn always_on() -> Self {
+        Self {
+            active_windows: vec![TimelineActiveWindow::open_from_start()],
+        }
+    }
+
     pub fn legacy_always_on() -> Self {
         Self {
             active_windows: vec![TimelineActiveWindow::open_from_start()],

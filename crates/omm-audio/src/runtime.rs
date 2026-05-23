@@ -18,7 +18,7 @@ use crate::{
 };
 use omm_protocol::{
     frames_for_duration_ms, ParamId, SourceAssetRef, SourceId, SourceInstanceId, SourceKind,
-    SourceTimelineSnapshot, SourceTimelineValidationError,
+    SourceTimelinePlacement, SourceTimelineSnapshot, SourceTimelineValidationError,
 };
 use ringbuf::traits::Split;
 use ringbuf::HeapRb;
@@ -163,6 +163,40 @@ impl AudioRuntime {
         Ok(())
     }
 
+    pub fn add_source_instance(
+        &mut self,
+        source_instance_id: SourceInstanceId,
+        source_kind: SourceKind,
+        asset_ref: Option<SourceAssetRef>,
+        timeline: SourceTimelinePlacement,
+        source: Box<dyn AudioSource>,
+    ) -> Result<(), SourceInstanceError> {
+        source_instance_id.validate()?;
+        if self
+            .channels
+            .iter()
+            .any(|ch| ch.source_instance_id() == &source_instance_id)
+        {
+            return Err(SourceInstanceError::DuplicateSourceInstance {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            });
+        }
+
+        let mut strip = ChannelStrip::new_timeline_source(
+            source_instance_id,
+            source_kind,
+            asset_ref,
+            timeline,
+            source,
+            self.sample_rate,
+        );
+        let capacity = analysis_ringbuf_capacity(self.sample_rate);
+        let (producer, _consumer) = HeapRb::<f32>::new(capacity).split();
+        strip.attach_analysis_producer(producer);
+        self.channels.push(strip);
+        Ok(())
+    }
+
     pub fn add_file_source_instance(
         &mut self,
         request: FileSourceInstanceRequest,
@@ -171,15 +205,6 @@ impl AudioRuntime {
         let source_instance_id = request.source_instance_id.as_str();
         if source_instance_id.starts_with("legacy:") {
             return Err(SourceInstanceError::ReservedSourceInstanceId {
-                source_instance_id: source_instance_id.to_string(),
-            });
-        }
-        if self
-            .channels
-            .iter()
-            .any(|channel| channel.source_instance_id() == &request.source_instance_id)
-        {
-            return Err(SourceInstanceError::DuplicateSourceInstance {
                 source_instance_id: source_instance_id.to_string(),
             });
         }
@@ -197,8 +222,9 @@ impl AudioRuntime {
         source.seek_frames(start_offset_frames);
 
         let timeline_start_ms = frames_to_ms(self.rendered_frames, self.sample_rate);
-        let mut strip = ChannelStrip::new_timeline_source(
-            request.source_instance_id,
+        let source_instance_id = request.source_instance_id;
+        self.add_source_instance(
+            source_instance_id.clone(),
             SourceKind::File,
             Some(SourceAssetRef::File {
                 uri: request.uri,
@@ -207,13 +233,31 @@ impl AudioRuntime {
             }),
             file_timeline(timeline_start_ms, request.start_offset_ms),
             Box::new(source),
-            self.sample_rate,
-        );
-        strip.set_gain_db(request.gain_db, 0);
-        strip.set_pan(request.pan, 0);
-        strip.set_highpass_hz(request.highpass_hz);
-        strip.set_lowpass_hz(request.lowpass_hz);
-        self.channels.push(strip);
+        )?;
+
+        let channel = self
+            .channel_by_instance_id_mut(&source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_gain_db(request.gain_db, 0);
+        channel.set_pan(request.pan, 0);
+        channel.set_highpass_hz(request.highpass_hz);
+        channel.set_lowpass_hz(request.lowpass_hz);
+        Ok(())
+    }
+
+    pub fn set_source_instance_enabled(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        enabled: bool,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_enabled(enabled);
         Ok(())
     }
 
@@ -663,6 +707,18 @@ impl AudioRuntime {
         Ok(())
     }
 
+    fn set_source_instance_enabled_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        enabled: bool,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_enabled(enabled);
+        Ok(())
+    }
+
     fn set_source_instance_pan_rt(
         &mut self,
         source_instance_id: RtSourceInstanceId,
@@ -858,6 +914,13 @@ impl AudioRuntime {
             }
             RtCommand::SetChannelEnabled { source_id, enabled } => {
                 self.set_channel_enabled(source_id, enabled);
+            }
+            RtCommand::SetSourceInstanceEnabled {
+                source_instance_id,
+                enabled,
+            } => {
+                let result = self.set_source_instance_enabled_rt(source_instance_id, enabled);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceGainDb {
                 source_instance_id,
