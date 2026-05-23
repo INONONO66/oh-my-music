@@ -51,7 +51,7 @@ impl Default for Mixer {
 mod tests {
     use super::*;
     use crate::source::TestToneSource;
-    use omm_protocol::SourceId;
+    use omm_protocol::{SourceInstanceId, SourceKind, SourceTimelinePlacement};
 
     const SAMPLE_RATE: u32 = 48_000;
     const FRAME_COUNT: usize = 128;
@@ -61,9 +61,16 @@ mod tests {
             .fold(0.0_f32, |acc, f| acc.max(f.left.abs()).max(f.right.abs()))
     }
 
-    fn test_channel(source_id: SourceId, freq_hz: f32) -> ChannelStrip {
-        ChannelStrip::new(
-            source_id,
+    fn test_channel(
+        source_instance_id: &str,
+        source_kind: SourceKind,
+        freq_hz: f32,
+    ) -> ChannelStrip {
+        ChannelStrip::new_timeline_source(
+            SourceInstanceId::new(source_instance_id),
+            source_kind,
+            None,
+            SourceTimelinePlacement::always_on(),
             Box::new(TestToneSource::new(freq_hz, SAMPLE_RATE)),
             SAMPLE_RATE,
         )
@@ -84,7 +91,7 @@ mod tests {
     #[test]
     fn test_render_single_source_produces_signal() {
         let mut mixer = Mixer::new();
-        let mut channels = vec![test_channel(SourceId::Glicol, 440.0)];
+        let mut channels = vec![test_channel("glicol:main", SourceKind::Generated, 440.0)];
         let mut output = vec![StereoFrame::SILENCE; FRAME_COUNT];
         mixer.render(&mut channels, &mut output);
         let p = peak(&output);
@@ -95,8 +102,8 @@ mod tests {
     fn test_render_two_sources_sum() {
         let mut mixer = Mixer::new();
         let mut channels = vec![
-            test_channel(SourceId::System, 440.0),
-            test_channel(SourceId::Glicol, 880.0),
+            test_channel("system:main", SourceKind::System, 440.0),
+            test_channel("glicol:main", SourceKind::Generated, 880.0),
         ];
         let mut output = vec![StereoFrame::SILENCE; FRAME_COUNT];
         mixer.render(&mut channels, &mut output);
@@ -107,8 +114,8 @@ mod tests {
     #[test]
     fn test_render_single_channel_matches_channel_strip_output() {
         let mut mixer = Mixer::new();
-        let mut direct = test_channel(SourceId::Glicol, 440.0);
-        let mut channels = vec![test_channel(SourceId::Glicol, 440.0)];
+        let mut direct = test_channel("glicol:main", SourceKind::Generated, 440.0);
+        let mut channels = vec![test_channel("glicol:main", SourceKind::Generated, 440.0)];
         let mut direct_output = vec![StereoFrame::SILENCE; FRAME_COUNT];
         let mut mixed_output = vec![StereoFrame::SILENCE; FRAME_COUNT];
 
@@ -136,7 +143,7 @@ mod tests {
     #[test]
     fn test_render_empty_output_does_not_panic() {
         let mut mixer = Mixer::new();
-        let mut channels = vec![test_channel(SourceId::Glicol, 440.0)];
+        let mut channels = vec![test_channel("glicol:main", SourceKind::Generated, 440.0)];
         let mut output: Vec<StereoFrame> = Vec::new();
         mixer.render(&mut channels, &mut output);
         assert!(output.is_empty());

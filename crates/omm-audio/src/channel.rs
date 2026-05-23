@@ -6,15 +6,14 @@ use crate::dsp::{
 use crate::frame::StereoFrame;
 use crate::source::AudioSource;
 use omm_protocol::{
-    PlaybackState, PlaybackStatusAuthority, SourceAssetRef, SourceEffectStatus, SourceId,
-    SourceInstanceId, SourceKind, SourcePlaybackStatus, SourceTimelinePlacement,
-    TimelineActiveWindow, TimelineSourceInstance,
+    PlaybackState, PlaybackStatusAuthority, SourceAssetRef, SourceEffectStatus, SourceInstanceId,
+    SourceKind, SourcePlaybackStatus, SourceTimelinePlacement, TimelineActiveWindow,
+    TimelineSourceInstance,
 };
 use ringbuf::traits::Producer;
 use ringbuf::HeapProd;
 
 pub struct ChannelStrip {
-    legacy_source_id: Option<SourceId>,
     source_instance_id: SourceInstanceId,
     source_kind: SourceKind,
     asset_ref: Option<SourceAssetRef>,
@@ -36,7 +35,6 @@ pub struct ChannelStrip {
 }
 
 struct ChannelStripMetadata {
-    legacy_source_id: Option<SourceId>,
     source_instance_id: SourceInstanceId,
     source_kind: SourceKind,
     asset_ref: Option<SourceAssetRef>,
@@ -45,21 +43,6 @@ struct ChannelStripMetadata {
 }
 
 impl ChannelStrip {
-    pub fn new(source_id: SourceId, source: Box<dyn AudioSource>, sample_rate: u32) -> Self {
-        Self::new_with_metadata(
-            ChannelStripMetadata {
-                legacy_source_id: Some(source_id),
-                source_instance_id: SourceInstanceId::legacy(source_id),
-                source_kind: SourceKind::from_legacy_source(source_id),
-                asset_ref: legacy_asset_ref(source_id),
-                timeline: SourceTimelinePlacement::legacy_always_on(),
-                playback_authority: PlaybackStatusAuthority::LegacyChannelEnabled,
-            },
-            source,
-            sample_rate,
-        )
-    }
-
     pub fn new_timeline_source(
         source_instance_id: SourceInstanceId,
         source_kind: SourceKind,
@@ -70,7 +53,6 @@ impl ChannelStrip {
     ) -> Self {
         Self::new_with_metadata(
             ChannelStripMetadata {
-                legacy_source_id: None,
                 source_instance_id,
                 source_kind,
                 asset_ref,
@@ -88,7 +70,6 @@ impl ChannelStrip {
         sample_rate: u32,
     ) -> Self {
         Self {
-            legacy_source_id: metadata.legacy_source_id,
             source_instance_id: metadata.source_instance_id,
             source_kind: metadata.source_kind,
             asset_ref: metadata.asset_ref,
@@ -110,10 +91,6 @@ impl ChannelStrip {
         }
     }
 
-    pub fn legacy_source_id(&self) -> Option<SourceId> {
-        self.legacy_source_id
-    }
-
     pub fn source_instance_id(&self) -> &SourceInstanceId {
         &self.source_instance_id
     }
@@ -132,17 +109,10 @@ impl ChannelStrip {
             timeline: self.timeline.clone(),
             playback,
             effects: self.effect_status(),
-            legacy_bridge: self
-                .legacy_source_id
-                .map(|source_id| omm_protocol::LegacySourceBridge { source_id }),
         }
     }
 
     fn playback_status(&self, engine_frame: u64, sample_rate: u32) -> SourcePlaybackStatus {
-        if self.playback_authority == PlaybackStatusAuthority::LegacyChannelEnabled {
-            return SourcePlaybackStatus::legacy_enabled(self.enabled);
-        }
-
         SourcePlaybackStatus {
             state: self.playback_state,
             authority: self.playback_authority,
@@ -299,22 +269,6 @@ fn frames_to_ms(frames: u64, sample_rate: u32) -> u64 {
     ((frames as u128 * 1_000) / sample_rate as u128) as u64
 }
 
-fn legacy_asset_ref(source_id: SourceId) -> Option<SourceAssetRef> {
-    match source_id {
-        SourceId::System => Some(SourceAssetRef::LiveInput {
-            label: "system".to_string(),
-        }),
-        SourceId::Mic => Some(SourceAssetRef::LiveInput {
-            label: "mic".to_string(),
-        }),
-        SourceId::Player => None,
-        SourceId::Glicol => Some(SourceAssetRef::Generated {
-            engine: omm_protocol::GeneratedEngine::Glicol,
-            code_ref: None,
-        }),
-    }
-}
-
 pub(crate) fn file_timeline(start_ms: u64, source_start_offset_ms: u64) -> SourceTimelinePlacement {
     SourceTimelinePlacement {
         active_windows: vec![TimelineActiveWindow {
@@ -377,8 +331,14 @@ mod tests {
     }
 
     fn render_sine(freq_hz: f32) -> ChannelStrip {
-        ChannelStrip::new(
-            SourceId::Glicol,
+        ChannelStrip::new_timeline_source(
+            SourceInstanceId::new("glicol:main"),
+            SourceKind::Generated,
+            Some(SourceAssetRef::Generated {
+                engine: omm_protocol::GeneratedEngine::Glicol,
+                code_ref: None,
+            }),
+            SourceTimelinePlacement::always_on(),
             Box::new(SineSource::new(freq_hz)),
             ENGINE_SAMPLE_RATE,
         )

@@ -423,7 +423,7 @@ mod tests {
 
     use omm_audio::runtime::AudioRuntimeConfig;
     use omm_audio::source::TestToneSource;
-    use omm_protocol::SourceId;
+    use omm_protocol::{SourceInstanceId, SourceKind, SourceTimelinePlacement};
     use ringbuf::traits::Consumer;
 
     #[test]
@@ -488,8 +488,11 @@ mod tests {
             sample_rate: ENGINE_SAMPLE_RATE,
         });
         assert!(runtime
-            .add_channel(
-                SourceId::Glicol,
+            .add_source_instance(
+                SourceInstanceId::new("glicol:main"),
+                SourceKind::Generated,
+                None,
+                SourceTimelinePlacement::always_on(),
                 Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
             )
             .is_ok());
@@ -510,8 +513,11 @@ mod tests {
             sample_rate: ENGINE_SAMPLE_RATE,
         });
         assert!(runtime
-            .add_channel(
-                SourceId::Glicol,
+            .add_source_instance(
+                SourceInstanceId::new("glicol:main"),
+                SourceKind::Generated,
+                None,
+                SourceTimelinePlacement::always_on(),
                 Box::new(TestToneSource::new(440.0, ENGINE_SAMPLE_RATE))
             )
             .is_ok());

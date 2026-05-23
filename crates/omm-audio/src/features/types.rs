@@ -1,9 +1,9 @@
-use omm_protocol::params::SourceId;
+use omm_protocol::SourceInstanceId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelFeatures {
-    pub source_id: SourceId,
+    pub source_instance_id: SourceInstanceId,
     pub window_start_ms: u64,
     pub window_duration_ms: u32,
     // Dynamics
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn channel_features_serializes_to_json() {
         let features = ChannelFeatures {
-            source_id: SourceId::Glicol,
+            source_instance_id: SourceInstanceId::new("glicol:main"),
             window_start_ms: 0,
             window_duration_ms: 2000,
             peak_db: -6.0,
@@ -125,7 +125,7 @@ mod tests {
         let deserialized: ChannelFeatures =
             serde_json::from_str(&json).expect("deserialization failed");
 
-        assert_eq!(deserialized.source_id, SourceId::Glicol);
+        assert_eq!(deserialized.source_instance_id.as_str(), "glicol:main");
         assert_eq!(deserialized.window_start_ms, 0);
         assert_eq!(deserialized.window_duration_ms, 2000);
         assert_eq!(deserialized.peak_db, -6.0);

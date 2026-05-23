@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use omm_protocol::params::SourceId;
+use omm_protocol::SourceInstanceId;
 use realfft::{RealFftPlanner, RealToComplex};
 use ringbuf::traits::Consumer;
 use ringbuf::HeapCons;
@@ -41,18 +41,21 @@ impl FeatureAnalyzerHandle {
         }
     }
 
-    pub fn register_channel(&self, source_id: SourceId, consumer: HeapCons<f32>) {
-        register_in_shared(&self.shared, source_id, consumer);
+    pub fn register_channel(&self, source_instance_id: SourceInstanceId, consumer: HeapCons<f32>) {
+        register_in_shared(&self.shared, source_instance_id, consumer);
     }
 
-    pub fn poll_features(&mut self, source_id: SourceId) -> Option<ChannelFeatures> {
+    pub fn poll_features(
+        &mut self,
+        source_instance_id: SourceInstanceId,
+    ) -> Option<ChannelFeatures> {
         let Ok(mut shared) = self.shared.lock() else {
             return None;
         };
 
         shared
             .channels
-            .get_mut(&source_id)
+            .get_mut(&source_instance_id)
             .and_then(|channel| channel.latest.take())
     }
 
@@ -98,8 +101,12 @@ pub(crate) struct FeatureRegistry {
 }
 
 impl FeatureRegistry {
-    pub(crate) fn register_channel(&self, source_id: SourceId, consumer: HeapCons<f32>) {
-        register_in_shared(&self.shared, source_id, consumer);
+    pub(crate) fn register_channel(
+        &self,
+        source_instance_id: SourceInstanceId,
+        consumer: HeapCons<f32>,
+    ) {
+        register_in_shared(&self.shared, source_instance_id, consumer);
     }
 }
 
@@ -119,7 +126,7 @@ impl Default for OfflineFeatureConfig {
 }
 
 pub fn compute_offline_channel_features(
-    source_id: SourceId,
+    source_instance_id: SourceInstanceId,
     samples: &[f32],
     sample_rate: u32,
     config: OfflineFeatureConfig,
@@ -132,7 +139,7 @@ pub fn compute_offline_channel_features(
 
     if samples.is_empty() {
         let silence = vec![0.0; window_samples];
-        results.push(computer.compute_with_duration(source_id, 0, 0, &silence));
+        results.push(computer.compute_with_duration(source_instance_id, 0, 0, &silence));
         return results;
     }
 
@@ -149,7 +156,7 @@ pub fn compute_offline_channel_features(
             window.resize(window_samples, 0.0);
         }
         results.push(computer.compute_with_duration(
-            source_id,
+            source_instance_id.clone(),
             start as u64,
             real_window_duration_ms,
             &window,
@@ -181,7 +188,7 @@ pub(crate) fn analysis_ringbuf_capacity(sample_rate: u32) -> usize {
 
 fn register_in_shared(
     shared: &Arc<Mutex<AnalyzerShared>>,
-    source_id: SourceId,
+    source_instance_id: SourceInstanceId,
     consumer: HeapCons<f32>,
 ) {
     let Ok(mut shared) = shared.lock() else {
@@ -190,15 +197,15 @@ fn register_in_shared(
 
     let window_samples = shared.window_samples;
     shared.channels.insert(
-        source_id,
-        AnalyzerChannel::new(source_id, consumer, window_samples),
+        source_instance_id.clone(),
+        AnalyzerChannel::new(source_instance_id, consumer, window_samples),
     );
 }
 
 struct AnalyzerShared {
     sample_rate: u32,
     window_samples: usize,
-    channels: HashMap<SourceId, AnalyzerChannel>,
+    channels: HashMap<SourceInstanceId, AnalyzerChannel>,
 }
 
 impl AnalyzerShared {
@@ -215,7 +222,7 @@ impl AnalyzerShared {
 }
 
 struct AnalyzerChannel {
-    source_id: SourceId,
+    source_instance_id: SourceInstanceId,
     consumer: HeapCons<f32>,
     samples: VecDeque<f32>,
     next_window_start_samples: u64,
@@ -223,9 +230,13 @@ struct AnalyzerChannel {
 }
 
 impl AnalyzerChannel {
-    fn new(source_id: SourceId, consumer: HeapCons<f32>, window_samples: usize) -> Self {
+    fn new(
+        source_instance_id: SourceInstanceId,
+        consumer: HeapCons<f32>,
+        window_samples: usize,
+    ) -> Self {
         Self {
-            source_id,
+            source_instance_id,
             consumer,
             samples: VecDeque::with_capacity(window_samples + HOP_SIZE),
             next_window_start_samples: 0,
@@ -253,8 +264,11 @@ impl AnalyzerChannel {
 
         while self.samples.len() >= window_samples {
             let window: Vec<f32> = self.samples.iter().take(window_samples).copied().collect();
-            self.latest =
-                Some(computer.compute(self.source_id, self.next_window_start_samples, &window));
+            self.latest = Some(computer.compute(
+                self.source_instance_id.clone(),
+                self.next_window_start_samples,
+                &window,
+            ));
 
             let consumed = HOP_SIZE.min(self.samples.len());
             self.samples.drain(..consumed);
@@ -294,16 +308,16 @@ impl FeatureComputer {
 
     pub(crate) fn compute(
         &mut self,
-        source_id: SourceId,
+        source_instance_id: SourceInstanceId,
         window_start_samples: u64,
         samples: &[f32],
     ) -> ChannelFeatures {
-        self.compute_with_duration(source_id, window_start_samples, WINDOW_MS, samples)
+        self.compute_with_duration(source_instance_id, window_start_samples, WINDOW_MS, samples)
     }
 
     fn compute_with_duration(
         &mut self,
-        source_id: SourceId,
+        source_instance_id: SourceInstanceId,
         window_start_samples: u64,
         window_duration_ms: u32,
         samples: &[f32],
@@ -323,7 +337,7 @@ impl FeatureComputer {
         let zero_crossing_rate = finite_or_default(zero_crossing_rate, 0.0);
 
         ChannelFeatures {
-            source_id,
+            source_instance_id,
             window_start_ms: window_start_samples.saturating_mul(1000) / self.sample_rate as u64,
             window_duration_ms,
             peak_db,
@@ -617,11 +631,13 @@ mod tests {
     const SAMPLE_RATE: u32 = 48_000;
     const WINDOW_SAMPLES: usize = SAMPLE_RATE as usize * WINDOW_MS as usize / 1000;
 
-    fn new_registered_analyzer(source_id: SourceId) -> (HeapProd<f32>, FeatureAnalyzerHandle) {
+    fn new_registered_analyzer(
+        source_instance_id: SourceInstanceId,
+    ) -> (HeapProd<f32>, FeatureAnalyzerHandle) {
         let ring = HeapRb::<f32>::new(WINDOW_SAMPLES + HOP_SIZE * 4);
         let (producer, consumer) = ring.split();
         let analyzer = FeatureAnalyzerHandle::new(SAMPLE_RATE);
-        analyzer.register_channel(source_id, consumer);
+        analyzer.register_channel(source_instance_id, consumer);
 
         (producer, analyzer)
     }
@@ -634,12 +650,12 @@ mod tests {
 
     fn wait_for_feature(
         analyzer: &mut FeatureAnalyzerHandle,
-        source_id: SourceId,
+        source_instance_id: SourceInstanceId,
     ) -> ChannelFeatures {
         let deadline = Instant::now() + Duration::from_millis(500);
 
         loop {
-            if let Some(features) = analyzer.poll_features(source_id) {
+            if let Some(features) = analyzer.poll_features(source_instance_id.clone()) {
                 return features;
             }
             assert!(Instant::now() < deadline, "timed out waiting for features");
@@ -660,7 +676,8 @@ mod tests {
 
     #[test]
     fn sine_1khz_centroid() {
-        let (mut producer, mut analyzer) = new_registered_analyzer(SourceId::Glicol);
+        let id = SourceInstanceId::new("glicol:main");
+        let (mut producer, mut analyzer) = new_registered_analyzer(id.clone());
         push_samples(
             &mut producer,
             (0..WINDOW_SAMPLES).map(|index| {
@@ -669,7 +686,7 @@ mod tests {
             }),
         );
 
-        let features = wait_for_feature(&mut analyzer, SourceId::Glicol);
+        let features = wait_for_feature(&mut analyzer, id);
 
         assert!(
             (900.0..=1_100.0).contains(&features.spectral_centroid_hz),
@@ -683,7 +700,8 @@ mod tests {
 
     #[test]
     fn white_noise_flatness() {
-        let (mut producer, mut analyzer) = new_registered_analyzer(SourceId::System);
+        let id = SourceInstanceId::new("system:main");
+        let (mut producer, mut analyzer) = new_registered_analyzer(id.clone());
         let mut state = 0x1234_5678_u32;
         push_samples(
             &mut producer,
@@ -694,7 +712,7 @@ mod tests {
             }),
         );
 
-        let features = wait_for_feature(&mut analyzer, SourceId::System);
+        let features = wait_for_feature(&mut analyzer, id);
 
         assert!(
             features.spectral_flatness > 0.6,
@@ -710,7 +728,7 @@ mod tests {
         let sample_rate = 48_000;
         let samples = vec![0.25; sample_rate as usize * 5 / 2];
         let features = compute_offline_channel_features(
-            SourceId::Player,
+            SourceInstanceId::new("player:main"),
             &samples,
             sample_rate,
             OfflineFeatureConfig {
@@ -727,10 +745,11 @@ mod tests {
 
     #[test]
     fn silence_no_nan() {
-        let (mut producer, mut analyzer) = new_registered_analyzer(SourceId::Mic);
+        let id = SourceInstanceId::new("mic:default");
+        let (mut producer, mut analyzer) = new_registered_analyzer(id.clone());
         push_samples(&mut producer, std::iter::repeat(0.0).take(WINDOW_SAMPLES));
 
-        let features = wait_for_feature(&mut analyzer, SourceId::Mic);
+        let features = wait_for_feature(&mut analyzer, id);
 
         assert!(all_fields_are_finite(&features));
         assert_eq!(features.peak_db, SILENCE_DB);
@@ -744,14 +763,15 @@ mod tests {
 
     #[test]
     fn click_train_onsets() {
-        let (mut producer, mut analyzer) = new_registered_analyzer(SourceId::Player);
+        let id = SourceInstanceId::new("player:main");
+        let (mut producer, mut analyzer) = new_registered_analyzer(id.clone());
         let interval = SAMPLE_RATE as usize / 10;
         push_samples(
             &mut producer,
             (0..WINDOW_SAMPLES).map(|index| if index % interval == 0 { 1.0 } else { 0.0 }),
         );
 
-        let features = wait_for_feature(&mut analyzer, SourceId::Player);
+        let features = wait_for_feature(&mut analyzer, id);
 
         assert!(
             (8.0..=11.0).contains(&features.onset_rate_per_sec),
@@ -763,7 +783,7 @@ mod tests {
 
     #[test]
     fn shutdown_within_100ms() {
-        let (_producer, analyzer) = new_registered_analyzer(SourceId::Glicol);
+        let (_producer, analyzer) = new_registered_analyzer(SourceInstanceId::new("glicol:main"));
         let start = Instant::now();
 
         analyzer.shutdown();

@@ -2,10 +2,14 @@ use std::env;
 use std::time::Duration;
 
 use cpal::traits::StreamTrait;
-use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource};
-use omm_audio::{run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand};
+use omm_audio::source::{GlicolSource, MicSource, MusicalTestSource, TestToneSource};
+use omm_audio::{
+    run_timeline_dj_demo, AudioRuntime, AudioRuntimeConfig, RtCommand, RtSourceInstanceId,
+};
 use omm_engine::cpal_io::CpalIo;
-use omm_protocol::SourceId;
+use omm_protocol::{
+    GeneratedEngine, SourceAssetRef, SourceInstanceId, SourceKind, SourceTimelinePlacement,
+};
 use ringbuf::traits::Consumer;
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -15,7 +19,13 @@ const MIC_TEST_DURATION_SECS: u64 = 3;
 const FEATURE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MIX_DEMO_GAIN_RAMP_FRAMES: u32 = 4_800;
 const MIC_MONITOR_GAIN_DB: f32 = 18.0;
+const MULTI_DEMO_DURATION_SECS: u64 = 15;
+const MULTI_DEMO_RAMP_FRAMES: u32 = 9_600;
 const MIX_DEMO_GLICOL_CODE: &str = "out: sin 110 >> mul 0.1";
+const GLICOL_INSTANCE_ID: &str = "glicol:main";
+const PLAYER_INSTANCE_ID: &str = "player:main";
+const SYSTEM_INSTANCE_ID: &str = "system:main";
+const MIC_INSTANCE_ID: &str = "mic:default";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             run_glicol(&args[2]).await?;
         }
         "mix-demo" => run_mix_demo().await?,
+        "multi-demo" => run_multi_demo().await?,
         "timeline-demo" => run_timeline_demo()?,
         "mic-test" => run_mic_test().await?,
         "mic-monitor" => run_mic_monitor().await?,
@@ -60,6 +71,7 @@ fn usage_text() -> String {
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"<glicol code>\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine multi-demo\n");
     text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n\n");
     text.push_str("  omm-engine mic-monitor\n\n");
@@ -67,6 +79,7 @@ fn usage_text() -> String {
     text.push_str("  omm-engine test-tone\n");
     text.push_str("  omm-engine glicol \"out: sin 440 >> mul 0.1\"\n");
     text.push_str("  omm-engine mix-demo\n");
+    text.push_str("  omm-engine multi-demo\n");
     text.push_str("  omm-engine timeline-demo\n");
     text.push_str("  omm-engine mic-test\n");
     text.push_str("  omm-engine mic-monitor\n");
@@ -80,7 +93,7 @@ async fn run_test_tone() -> anyhow::Result<()> {
         sample_rate: SAMPLE_RATE,
     });
     let source = Box::new(MusicalTestSource::new(SAMPLE_RATE));
-    runtime.add_channel(SourceId::Glicol, source)?;
+    add_glicol_source(&mut runtime, source)?;
 
     let _io = CpalIo::new(runtime, None)?;
     println!("Audio stream started. Press Ctrl-C to stop.");
@@ -110,7 +123,7 @@ async fn run_glicol(code: &str) -> anyhow::Result<()> {
     }
     println!("Glicol code loaded successfully.");
 
-    runtime.add_channel(SourceId::Glicol, Box::new(source))?;
+    add_glicol_source(&mut runtime, Box::new(source))?;
     let _io = CpalIo::new(runtime, None)?;
     println!("Audio stream started. Press Ctrl-C to stop.");
 
@@ -133,27 +146,24 @@ async fn run_mix_demo() -> anyhow::Result<()> {
         eprintln!("Glicol code load failed: {err}");
         std::process::exit(1);
     }
-    runtime.add_channel(SourceId::Glicol, Box::new(glicol))?;
+    add_glicol_source(&mut runtime, Box::new(glicol))?;
 
-    runtime.add_channel(
-        SourceId::Player,
-        Box::new(MusicalTestSource::new(SAMPLE_RATE)),
-    )?;
+    add_player_source(&mut runtime, Box::new(MusicalTestSource::new(SAMPLE_RATE)))?;
 
     if mic_stream.is_some() {
-        let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-            source_id: SourceId::Mic,
+        let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+            source_instance_id: RtSourceInstanceId::new(MIC_INSTANCE_ID),
             db: -3.0,
             ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
         });
     }
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Glicol,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
         db: -6.0,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Player,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
         db: -6.0,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
@@ -195,6 +205,221 @@ fn run_timeline_demo() -> anyhow::Result<()> {
     let report = run_timeline_dj_demo(Default::default())?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn add_glicol_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(GLICOL_INSTANCE_ID),
+        SourceKind::Generated,
+        Some(SourceAssetRef::Generated {
+            engine: GeneratedEngine::Glicol,
+            code_ref: None,
+        }),
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
+fn add_player_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(PLAYER_INSTANCE_ID),
+        SourceKind::File,
+        None,
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
+fn add_system_source(
+    runtime: &mut AudioRuntime,
+    source: Box<dyn omm_audio::source::AudioSource>,
+) -> anyhow::Result<()> {
+    runtime.add_source_instance(
+        SourceInstanceId::new(SYSTEM_INSTANCE_ID),
+        SourceKind::System,
+        None,
+        SourceTimelinePlacement::always_on(),
+        source,
+    )?;
+    Ok(())
+}
+
+async fn run_multi_demo() -> anyhow::Result<()> {
+    println!("multi-demo: 3 sources + Glicol, individual effects, {MULTI_DEMO_DURATION_SECS}s");
+
+    let (mut runtime, mut command_queue, _features) = AudioRuntime::new(AudioRuntimeConfig {
+        sample_rate: SAMPLE_RATE,
+    });
+
+    let mut glicol = GlicolSource::new(SAMPLE_RATE);
+    glicol.load_code("out: saw 55 >> lpf 800 0.5 >> mul 0.15")?;
+    add_glicol_source(&mut runtime, Box::new(glicol))?;
+
+    add_player_source(&mut runtime, Box::new(MusicalTestSource::new(SAMPLE_RATE)))?;
+
+    add_system_source(
+        &mut runtime,
+        Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
+    )?;
+
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+        db: -3.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+        pan: -0.7,
+        ramp_frames: 0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+        db: -6.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+        pan: 0.7,
+        ramp_frames: 0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+        db: -12.0,
+        ramp_frames: 0,
+    });
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceHighpassHz {
+        source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+        hz: 300.0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+        source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+        low_db: 4.0,
+        mid_db: 0.0,
+        high_db: -2.0,
+        ramp_frames: 0,
+    });
+
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+        source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+        send_db: -6.0,
+        ramp_frames: 0,
+    });
+
+    let _io = CpalIo::new(runtime, None)?;
+    println!("  Glicol (saw 55 Hz, LPF 800): left, -3 dB, reverb -6 dB");
+    println!("  MusicalTest pattern:          right, -6 dB, EQ low+4/high-2");
+    println!("  TestTone 440 Hz:              center, -12 dB, HPF 300");
+    println!("Playing 15s... press Ctrl-C to stop early.");
+    println!();
+
+    let total = Duration::from_secs(MULTI_DEMO_DURATION_SECS);
+    let phase2_at = tokio::time::Instant::now() + Duration::from_secs(5);
+    let phase3_at = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::sleep(total);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(deadline);
+    tokio::pin!(ctrl_c);
+
+    let mut phase2_done = false;
+    let mut phase3_done = false;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                println!("{MULTI_DEMO_DURATION_SECS}s elapsed, stopping.");
+                return Ok(());
+            }
+            _ = &mut ctrl_c => {
+                println!("Ctrl-C, stopping.");
+                return Ok(());
+            }
+            _ = tokio::time::sleep_until(phase2_at), if !phase2_done => {
+                phase2_done = true;
+                println!("  -- 5s: reverb up, EQ shift, pan swap --");
+
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    send_db: 0.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    pan: 0.7,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    low_db: -6.0,
+                    mid_db: 6.0,
+                    high_db: 4.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstancePan {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    pan: -0.7,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    send_db: -3.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    db: -6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+            }
+            _ = tokio::time::sleep_until(phase3_at), if !phase3_done => {
+                phase3_done = true;
+                println!("  -- 10s: heavy reverb, EQ kill bass, LPF down --");
+
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    send_db: 6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(GLICOL_INSTANCE_ID),
+                    low_db: -12.0,
+                    mid_db: 0.0,
+                    high_db: 6.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceLowpassHz {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    hz: 800.0,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                    source_instance_id: RtSourceInstanceId::new(PLAYER_INSTANCE_ID),
+                    send_db: 0.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceLowpassHz {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    hz: 1_000.0,
+                });
+                let _ = command_queue.enqueue(RtCommand::SetSourceInstanceEq {
+                    source_instance_id: RtSourceInstanceId::new(SYSTEM_INSTANCE_ID),
+                    low_db: 6.0,
+                    mid_db: -6.0,
+                    high_db: -12.0,
+                    ramp_frames: MULTI_DEMO_RAMP_FRAMES,
+                });
+            }
+        }
+    }
 }
 
 async fn run_mic_test() -> anyhow::Result<()> {
@@ -247,8 +472,8 @@ async fn run_mic_monitor() -> anyhow::Result<()> {
         anyhow::bail!("microphone is unavailable");
     }
 
-    let _ = command_queue.enqueue(RtCommand::SetChannelGainDb {
-        source_id: SourceId::Mic,
+    let _ = command_queue.enqueue(RtCommand::SetSourceInstanceGainDb {
+        source_instance_id: RtSourceInstanceId::new(MIC_INSTANCE_ID),
         db: MIC_MONITOR_GAIN_DB,
         ramp_frames: MIX_DEMO_GAIN_RAMP_FRAMES,
     });
@@ -295,7 +520,15 @@ fn build_mic_channel(runtime: &mut AudioRuntime) -> Option<cpal::Stream> {
         }
     };
 
-    if let Err(err) = runtime.add_channel(SourceId::Mic, Box::new(mic)) {
+    if let Err(err) = runtime.add_source_instance(
+        SourceInstanceId::new(MIC_INSTANCE_ID),
+        SourceKind::Mic,
+        Some(SourceAssetRef::LiveInput {
+            label: "microphone".to_string(),
+        }),
+        SourceTimelinePlacement::always_on(),
+        Box::new(mic),
+    ) {
         eprintln!("Failed to attach mic channel; continuing without mic: {err}");
         return None;
     }
@@ -333,6 +566,10 @@ mod tests {
             "usage missing timeline-demo: {text}"
         );
         assert!(text.contains("mic-test"), "usage missing mic-test: {text}");
+        assert!(
+            text.contains("multi-demo"),
+            "usage missing multi-demo: {text}"
+        );
         assert!(
             text.contains("mic-monitor"),
             "usage missing mic-monitor: {text}"

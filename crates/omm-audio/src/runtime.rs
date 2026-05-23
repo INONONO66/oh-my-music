@@ -17,17 +17,11 @@ use crate::{
     RtCommandSchedulerError,
 };
 use omm_protocol::{
-    frames_for_duration_ms, ParamId, SourceAssetRef, SourceId, SourceInstanceId, SourceKind,
-    SourceTimelineSnapshot, SourceTimelineValidationError,
+    frames_for_duration_ms, ParamId, SourceAssetRef, SourceInstanceId, SourceKind,
+    SourceTimelinePlacement, SourceTimelineSnapshot, SourceTimelineValidationError,
 };
 use ringbuf::traits::Split;
 use ringbuf::HeapRb;
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum ChannelError {
-    #[error("duplicate source id: {source_id:?}")]
-    DuplicateSourceId { source_id: SourceId },
-}
 
 #[derive(Debug)]
 pub struct FileSourceInstanceRequest {
@@ -65,8 +59,6 @@ pub enum SourceInstanceError {
     Validation(#[from] SourceTimelineValidationError),
     #[error("source instance already exists: {source_instance_id}")]
     DuplicateSourceInstance { source_instance_id: String },
-    #[error("source instance id is reserved for fixed legacy channels: {source_instance_id}")]
-    ReservedSourceInstanceId { source_instance_id: String },
     #[error("start offset {start_offset_ms} ms is not before file duration {duration_ms} ms")]
     StartOffsetBeyondDuration {
         start_offset_ms: u64,
@@ -141,24 +133,38 @@ impl AudioRuntime {
         )
     }
 
-    pub fn add_channel(
+    pub fn add_source_instance(
         &mut self,
-        source_id: SourceId,
+        source_instance_id: SourceInstanceId,
+        source_kind: SourceKind,
+        asset_ref: Option<SourceAssetRef>,
+        timeline: SourceTimelinePlacement,
         source: Box<dyn AudioSource>,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<(), SourceInstanceError> {
+        source_instance_id.validate()?;
         if self
             .channels
             .iter()
-            .any(|channel| channel.legacy_source_id() == Some(source_id))
+            .any(|ch| ch.source_instance_id() == &source_instance_id)
         {
-            return Err(ChannelError::DuplicateSourceId { source_id });
+            return Err(SourceInstanceError::DuplicateSourceInstance {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            });
         }
 
-        let mut strip = ChannelStrip::new(source_id, source, self.sample_rate);
+        let mut strip = ChannelStrip::new_timeline_source(
+            source_instance_id.clone(),
+            source_kind,
+            asset_ref,
+            timeline,
+            source,
+            self.sample_rate,
+        );
         let capacity = analysis_ringbuf_capacity(self.sample_rate);
         let (producer, consumer) = HeapRb::<f32>::new(capacity).split();
         strip.attach_analysis_producer(producer);
-        self.feature_registry.register_channel(source_id, consumer);
+        self.feature_registry
+            .register_channel(source_instance_id.clone(), consumer);
         self.channels.push(strip);
         Ok(())
     }
@@ -168,22 +174,6 @@ impl AudioRuntime {
         request: FileSourceInstanceRequest,
     ) -> Result<(), SourceInstanceError> {
         request.source_instance_id.validate()?;
-        let source_instance_id = request.source_instance_id.as_str();
-        if source_instance_id.starts_with("legacy:") {
-            return Err(SourceInstanceError::ReservedSourceInstanceId {
-                source_instance_id: source_instance_id.to_string(),
-            });
-        }
-        if self
-            .channels
-            .iter()
-            .any(|channel| channel.source_instance_id() == &request.source_instance_id)
-        {
-            return Err(SourceInstanceError::DuplicateSourceInstance {
-                source_instance_id: source_instance_id.to_string(),
-            });
-        }
-
         let mut source = PlayerSource::from_bytes(&request.bytes, self.sample_rate)?;
         let duration_frames = source.duration_frames() as u64;
         let duration_ms = frames_to_ms(duration_frames, self.sample_rate);
@@ -197,8 +187,9 @@ impl AudioRuntime {
         source.seek_frames(start_offset_frames);
 
         let timeline_start_ms = frames_to_ms(self.rendered_frames, self.sample_rate);
-        let mut strip = ChannelStrip::new_timeline_source(
-            request.source_instance_id,
+        let source_instance_id = request.source_instance_id;
+        self.add_source_instance(
+            source_instance_id.clone(),
             SourceKind::File,
             Some(SourceAssetRef::File {
                 uri: request.uri,
@@ -207,13 +198,31 @@ impl AudioRuntime {
             }),
             file_timeline(timeline_start_ms, request.start_offset_ms),
             Box::new(source),
-            self.sample_rate,
-        );
-        strip.set_gain_db(request.gain_db, 0);
-        strip.set_pan(request.pan, 0);
-        strip.set_highpass_hz(request.highpass_hz);
-        strip.set_lowpass_hz(request.lowpass_hz);
-        self.channels.push(strip);
+        )?;
+
+        let channel = self
+            .channel_by_instance_id_mut(&source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_gain_db(request.gain_db, 0);
+        channel.set_pan(request.pan, 0);
+        channel.set_highpass_hz(request.highpass_hz);
+        channel.set_lowpass_hz(request.lowpass_hz);
+        Ok(())
+    }
+
+    pub fn set_source_instance_enabled(
+        &mut self,
+        source_instance_id: &SourceInstanceId,
+        enabled: bool,
+    ) -> Result<(), SourceInstanceError> {
+        let channel = self
+            .channel_by_instance_id_mut(source_instance_id)
+            .ok_or_else(|| SourceInstanceError::SourceInstanceNotFound {
+                source_instance_id: source_instance_id.as_str().to_string(),
+            })?;
+        channel.set_enabled(enabled);
         Ok(())
     }
 
@@ -581,56 +590,6 @@ impl AudioRuntime {
         self.highpass.set_cutoff(hz);
     }
 
-    pub fn set_channel_gain_db(&mut self, source_id: SourceId, db: f32, ramp_frames: u32) {
-        if let Some(channel) = self
-            .channels
-            .iter_mut()
-            .find(|ch| ch.legacy_source_id() == Some(source_id))
-        {
-            channel.set_gain_db(db, ramp_frames);
-        }
-    }
-
-    pub fn set_channel_pan(&mut self, source_id: SourceId, pan: f32, ramp_frames: u32) {
-        if let Some(channel) = self
-            .channels
-            .iter_mut()
-            .find(|ch| ch.legacy_source_id() == Some(source_id))
-        {
-            channel.set_pan(pan, ramp_frames);
-        }
-    }
-
-    pub fn set_channel_highpass_hz(&mut self, source_id: SourceId, hz: f32) {
-        if let Some(channel) = self
-            .channels
-            .iter_mut()
-            .find(|ch| ch.legacy_source_id() == Some(source_id))
-        {
-            channel.set_highpass_hz(hz);
-        }
-    }
-
-    pub fn set_channel_lowpass_hz(&mut self, source_id: SourceId, hz: f32) {
-        if let Some(channel) = self
-            .channels
-            .iter_mut()
-            .find(|ch| ch.legacy_source_id() == Some(source_id))
-        {
-            channel.set_lowpass_hz(hz);
-        }
-    }
-
-    pub fn set_channel_enabled(&mut self, source_id: SourceId, enabled: bool) {
-        if let Some(channel) = self
-            .channels
-            .iter_mut()
-            .find(|ch| ch.legacy_source_id() == Some(source_id))
-        {
-            channel.set_enabled(enabled);
-        }
-    }
-
     fn channel_by_instance_id_mut(
         &mut self,
         source_instance_id: &SourceInstanceId,
@@ -660,6 +619,18 @@ impl AudioRuntime {
             .channel_by_instance_id_str_mut(&source_instance_id)
             .ok_or(SourceInstanceRtCommandError::NotFound)?;
         channel.set_gain_db(db, ramp_frames);
+        Ok(())
+    }
+
+    fn set_source_instance_enabled_rt(
+        &mut self,
+        source_instance_id: RtSourceInstanceId,
+        enabled: bool,
+    ) -> Result<(), SourceInstanceRtCommandError> {
+        let channel = self
+            .channel_by_instance_id_str_mut(&source_instance_id)
+            .ok_or(SourceInstanceRtCommandError::NotFound)?;
+        channel.set_enabled(enabled);
         Ok(())
     }
 
@@ -836,28 +807,12 @@ impl AudioRuntime {
             RtCommand::SetMasterHighpassHz { hz } => {
                 self.set_highpass_hz(hz);
             }
-            RtCommand::SetChannelGainDb {
-                source_id,
-                db,
-                ramp_frames,
+            RtCommand::SetSourceInstanceEnabled {
+                source_instance_id,
+                enabled,
             } => {
-                self.set_channel_gain_db(source_id, db, ramp_frames);
-            }
-            RtCommand::SetChannelPan {
-                source_id,
-                pan,
-                ramp_frames,
-            } => {
-                self.set_channel_pan(source_id, pan, ramp_frames);
-            }
-            RtCommand::SetChannelLowpassHz { source_id, hz } => {
-                self.set_channel_lowpass_hz(source_id, hz);
-            }
-            RtCommand::SetChannelHighpassHz { source_id, hz } => {
-                self.set_channel_highpass_hz(source_id, hz);
-            }
-            RtCommand::SetChannelEnabled { source_id, enabled } => {
-                self.set_channel_enabled(source_id, enabled);
+                let result = self.set_source_instance_enabled_rt(source_instance_id, enabled);
+                self.observe_source_instance_command_result(result);
             }
             RtCommand::SetSourceInstanceGainDb {
                 source_instance_id,
@@ -970,8 +925,7 @@ mod tests {
     use crate::features::ChannelFeatures;
     use crate::source::{GlicolSource, TestToneSource};
     use omm_protocol::{
-        ActionOrigin, EngineTime, PlaybackState, ScheduledActionId, SourceAssetRef, SourceId,
-        SourceKind,
+        ActionOrigin, EngineTime, PlaybackState, ScheduledActionId, SourceAssetRef, SourceKind,
     };
 
     const SAMPLE_RATE: u32 = 48_000;
@@ -1029,11 +983,80 @@ mod tests {
 
     fn add_test_channel(
         runtime: &mut AudioRuntime,
-        source_id: SourceId,
+        source_instance_id: SourceInstanceId,
+        source_kind: SourceKind,
+        asset_ref: Option<SourceAssetRef>,
         source: Box<dyn AudioSource>,
-    ) {
-        let result = runtime.add_channel(source_id, source);
-        assert!(result.is_ok(), "channel should be added: {result:?}");
+    ) -> SourceInstanceId {
+        let result = runtime.add_source_instance(
+            source_instance_id.clone(),
+            source_kind,
+            asset_ref,
+            SourceTimelinePlacement::always_on(),
+            source,
+        );
+        assert!(
+            result.is_ok(),
+            "source instance should be added: {result:?}"
+        );
+        source_instance_id
+    }
+
+    fn add_glicol_channel(
+        runtime: &mut AudioRuntime,
+        source: Box<dyn AudioSource>,
+    ) -> SourceInstanceId {
+        add_test_channel(
+            runtime,
+            SourceInstanceId::new("glicol:main"),
+            SourceKind::Generated,
+            Some(SourceAssetRef::Generated {
+                engine: omm_protocol::GeneratedEngine::Glicol,
+                code_ref: None,
+            }),
+            source,
+        )
+    }
+
+    fn add_player_channel(
+        runtime: &mut AudioRuntime,
+        source: Box<dyn AudioSource>,
+    ) -> SourceInstanceId {
+        add_test_channel(
+            runtime,
+            SourceInstanceId::new("player:main"),
+            SourceKind::File,
+            None,
+            source,
+        )
+    }
+
+    fn add_system_channel(
+        runtime: &mut AudioRuntime,
+        source: Box<dyn AudioSource>,
+    ) -> SourceInstanceId {
+        add_test_channel(
+            runtime,
+            SourceInstanceId::new("system:main"),
+            SourceKind::System,
+            None,
+            source,
+        )
+    }
+
+    fn add_mic_channel(
+        runtime: &mut AudioRuntime,
+        source: Box<dyn AudioSource>,
+    ) -> SourceInstanceId {
+        add_test_channel(
+            runtime,
+            SourceInstanceId::new("mic:default"),
+            SourceKind::Mic,
+            Some(SourceAssetRef::LiveInput {
+                label: "microphone".to_string(),
+            }),
+            source,
+        )
     }
 
     fn file_request(
@@ -1117,42 +1140,52 @@ mod tests {
         mono_wav(SAMPLE_RATE, &samples)
     }
 
-    fn runtime_with_loud_channels(source_ids: &[SourceId], value: f32) -> AudioRuntime {
+    fn runtime_with_loud_channels(source_ids: &[&str], value: f32) -> AudioRuntime {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
         runtime.set_master_pan(-1.0, 0);
 
         for source_id in source_ids {
-            add_test_channel(&mut runtime, *source_id, Box::new(LoudSource::new(value)));
+            match *source_id {
+                "system:main" => add_system_channel(&mut runtime, Box::new(LoudSource::new(value))),
+                "mic:default" => add_mic_channel(&mut runtime, Box::new(LoudSource::new(value))),
+                "player:main" => add_player_channel(&mut runtime, Box::new(LoudSource::new(value))),
+                "glicol:main" => add_glicol_channel(&mut runtime, Box::new(LoudSource::new(value))),
+                _ => unreachable!("test source id is fixed"),
+            };
         }
 
         runtime
     }
 
     #[test]
-    fn add_channel_duplicate_source_id_rejected() {
+    fn add_source_instance_duplicate_id_rejected() {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
 
-        let first = runtime.add_channel(
-            SourceId::System,
+        let first = runtime.add_source_instance(
+            SourceInstanceId::new("system:main"),
+            SourceKind::System,
+            None,
+            SourceTimelinePlacement::always_on(),
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
-        assert!(first.is_ok(), "first System channel should be accepted");
+        assert!(first.is_ok(), "first System source should be accepted");
 
-        let duplicate = runtime.add_channel(
-            SourceId::System,
+        let duplicate = runtime.add_source_instance(
+            SourceInstanceId::new("system:main"),
+            SourceKind::System,
+            None,
+            SourceTimelinePlacement::always_on(),
             Box::new(TestToneSource::new(880.0, SAMPLE_RATE)),
         );
 
-        assert_eq!(
+        assert!(matches!(
             duplicate,
-            Err(ChannelError::DuplicateSourceId {
-                source_id: SourceId::System
-            })
-        );
+            Err(SourceInstanceError::DuplicateSourceInstance { .. })
+        ));
     }
 
     #[test]
@@ -1225,15 +1258,6 @@ mod tests {
             Err(SourceInstanceError::Validation(
                 SourceTimelineValidationError::InvalidSourceInstanceId { .. }
             ))
-        ));
-        assert!(matches!(
-            runtime.add_file_source_instance(file_request(
-                "legacy:mic",
-                "mem://reserved.wav",
-                &bytes,
-                0
-            )),
-            Err(SourceInstanceError::ReservedSourceInstanceId { .. })
         ));
     }
 
@@ -1637,11 +1661,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output = vec![StereoFrame::SILENCE; FRAME_COUNT];
 
         runtime.render_block(&mut output);
@@ -1656,11 +1676,7 @@ mod tests {
             sample_rate: SAMPLE_RATE,
         });
         runtime.set_master_gain_db(-60.0, 0);
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -1674,9 +1690,8 @@ mod tests {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
         assert!(queue
@@ -1698,9 +1713,8 @@ mod tests {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -1740,9 +1754,8 @@ mod tests {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -1788,11 +1801,7 @@ mod tests {
             sample_rate: SAMPLE_RATE,
         });
         runtime.set_master_gain_db(0.0, 0);
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -1807,9 +1816,8 @@ mod tests {
             sample_rate: SAMPLE_RATE,
         });
         unity.set_master_pan(-1.0, 0);
-        add_test_channel(
+        add_glicol_channel(
             &mut unity,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -1818,9 +1826,8 @@ mod tests {
         });
         attenuated.set_master_gain_db(-6.0, 0);
         attenuated.set_master_pan(-1.0, 0);
-        add_test_channel(
+        add_glicol_channel(
             &mut attenuated,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -1843,12 +1850,7 @@ mod tests {
 
     #[test]
     fn master_gain_applies_to_all_channel_output() {
-        let source_ids = [
-            SourceId::System,
-            SourceId::Mic,
-            SourceId::Player,
-            SourceId::Glicol,
-        ];
+        let source_ids = ["system:main", "mic:default", "player:main", "glicol:main"];
         let mut unity = runtime_with_loud_channels(&source_ids, 0.05);
         let mut attenuated = runtime_with_loud_channels(&source_ids, 0.05);
         attenuated.set_master_gain_db(-6.0, 0);
@@ -1867,14 +1869,9 @@ mod tests {
 
     #[test]
     fn four_channels_summed() {
-        let mut single = runtime_with_loud_channels(&[SourceId::System], 0.05);
+        let mut single = runtime_with_loud_channels(&["system:main"], 0.05);
         let mut four = runtime_with_loud_channels(
-            &[
-                SourceId::System,
-                SourceId::Mic,
-                SourceId::Player,
-                SourceId::Glicol,
-            ],
+            &["system:main", "mic:default", "player:main", "glicol:main"],
             0.05,
         );
 
@@ -1895,11 +1892,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -1912,11 +1905,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(LoudSource::new(10_000.0)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(LoudSource::new(10_000.0)));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -1934,11 +1923,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -1953,9 +1938,8 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_player_channel(
             &mut runtime,
-            SourceId::Player,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -1964,8 +1948,8 @@ mod tests {
                 action_id: ScheduledActionId::new("mute-at-frame-256"),
                 origin: ActionOrigin::Test,
                 trigger_frame: 256,
-                command: RtCommand::SetChannelEnabled {
-                    source_id: SourceId::Player,
+                command: RtCommand::SetSourceInstanceEnabled {
+                    source_instance_id: RtSourceInstanceId::new("player:main"),
                     enabled: false,
                 },
             })
@@ -2044,25 +2028,24 @@ mod tests {
     }
 
     #[test]
-    fn runtime_reports_legacy_channels_as_timeline_source_instances() {
+    fn runtime_reports_source_instances_in_timeline_snapshot() {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_player_channel(
             &mut runtime,
-            SourceId::Player,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 db: -9.0,
                 ramp_frames: 0,
             })
             .is_ok());
         assert!(queue
-            .enqueue(RtCommand::SetChannelPan {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 pan: 0.5,
                 ramp_frames: 0,
             })
@@ -2076,12 +2059,11 @@ mod tests {
         assert_eq!(snapshot.sample_rate, SAMPLE_RATE);
         assert_eq!(snapshot.sources.len(), 1);
         let source = &snapshot.sources[0];
-        assert_eq!(source.source_instance_id.as_str(), "legacy:player");
+        assert_eq!(source.source_instance_id.as_str(), "player:main");
         assert_eq!(source.source_kind, SourceKind::File);
         assert_eq!(source.playback.state, PlaybackState::Playing);
         assert_eq!(source.effects.gain_db, -9.0);
         assert_eq!(source.effects.pan, 0.5);
-        assert_eq!(source.legacy_bridge.unwrap().source_id, SourceId::Player);
         assert!(source.timeline.is_active_at(0));
     }
 
@@ -2090,11 +2072,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut runtime,
-            SourceId::Glicol,
-            Box::new(TestToneSource::new(440.0, 48000)),
-        );
+        add_glicol_channel(&mut runtime, Box::new(TestToneSource::new(440.0, 48000)));
         let mut output: Vec<StereoFrame> = Vec::new();
 
         runtime.render_block(&mut output);
@@ -2107,16 +2085,11 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
-        add_test_channel(
-            &mut runtime,
-            SourceId::System,
-            Box::new(LoudSource::new(0.25)),
-        );
+        add_system_channel(&mut runtime, Box::new(LoudSource::new(0.25)));
 
         let mut output = vec![StereoFrame::SILENCE; FRAME_COUNT];
 
@@ -2138,7 +2111,7 @@ mod tests {
         let (mut runtime, _queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(&mut runtime, SourceId::Glicol, Box::new(source));
+        add_glicol_channel(&mut runtime, Box::new(source));
         let mut output = vec![StereoFrame::SILENCE; 256];
 
         runtime.render_block(&mut output);
@@ -2154,9 +2127,8 @@ mod tests {
             sample_rate: SAMPLE_RATE,
         });
         unity.set_master_pan(-1.0, 0);
-        add_test_channel(
+        add_glicol_channel(
             &mut unity,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -2164,15 +2136,14 @@ mod tests {
             sample_rate: SAMPLE_RATE,
         });
         attenuated.set_master_pan(-1.0, 0);
-        add_test_channel(
+        add_glicol_channel(
             &mut attenuated,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
         assert!(queue_att
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Glicol,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 db: -6.0,
                 ramp_frames: 0,
             })
@@ -2195,24 +2166,16 @@ mod tests {
         let (mut center, _queue_center, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut center,
-            SourceId::Player,
-            Box::new(LoudSource::new(0.5)),
-        );
+        add_player_channel(&mut center, Box::new(LoudSource::new(0.5)));
 
         let (mut hard_left, mut queue_left, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
-            &mut hard_left,
-            SourceId::Player,
-            Box::new(LoudSource::new(0.5)),
-        );
+        add_player_channel(&mut hard_left, Box::new(LoudSource::new(0.5)));
 
         assert!(queue_left
-            .enqueue(RtCommand::SetChannelPan {
-                source_id: SourceId::Player,
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new("player:main"),
                 pan: -1.0,
                 ramp_frames: 0,
             })
@@ -2245,15 +2208,14 @@ mod tests {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
         assert!(queue
-            .enqueue(RtCommand::SetChannelGainDb {
-                source_id: SourceId::Mic,
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("mic:default"),
                 db: -60.0,
                 ramp_frames: 0,
             })
@@ -2274,9 +2236,8 @@ mod tests {
         let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(440.0, SAMPLE_RATE)),
         );
 
@@ -2289,7 +2250,7 @@ mod tests {
             .is_ok());
         assert!(queue
             .enqueue(RtCommand::SetSourceInstancePlaybackRate {
-                source_instance_id: RtSourceInstanceId::new("legacy:glicol"),
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
                 rate: 2.0,
                 ramp_frames: 0,
             })
@@ -2309,9 +2270,8 @@ mod tests {
         let (mut runtime, _queue, mut handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(1_000.0, SAMPLE_RATE)),
         );
 
@@ -2326,7 +2286,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let features = loop {
-            if let Some(features) = handle.poll_features(SourceId::Glicol) {
+            if let Some(features) = handle.poll_features(SourceInstanceId::new("glicol:main")) {
                 break features;
             }
             assert!(
@@ -2336,7 +2296,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        assert_eq!(features.source_id, SourceId::Glicol);
+        assert_eq!(features.source_instance_id.as_str(), "glicol:main");
         assert!(
             (900.0..=1_100.0).contains(&features.spectral_centroid_hz),
             "expected centroid ~1kHz, got {}",
@@ -2351,14 +2311,12 @@ mod tests {
         let (mut runtime, _queue, mut handle) = AudioRuntime::new(AudioRuntimeConfig {
             sample_rate: SAMPLE_RATE,
         });
-        add_test_channel(
+        add_glicol_channel(
             &mut runtime,
-            SourceId::Glicol,
             Box::new(TestToneSource::new(1_000.0, SAMPLE_RATE)),
         );
-        add_test_channel(
+        add_player_channel(
             &mut runtime,
-            SourceId::Player,
             Box::new(TestToneSource::new(5_000.0, SAMPLE_RATE)),
         );
 
@@ -2376,9 +2334,9 @@ mod tests {
         let mut player_features: Option<ChannelFeatures> = None;
         while glicol_features.is_none() || player_features.is_none() {
             for snapshot in handle.poll_all() {
-                match snapshot.source_id {
-                    SourceId::Glicol => glicol_features = Some(snapshot),
-                    SourceId::Player => player_features = Some(snapshot),
+                match snapshot.source_instance_id.as_str() {
+                    "glicol:main" => glicol_features = Some(snapshot),
+                    "player:main" => player_features = Some(snapshot),
                     _ => {}
                 }
             }
@@ -2423,5 +2381,254 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "expected handle drop to join analyzer thread quickly, took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn multi_file_instances_with_individual_effects_and_glicol() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+
+        let file_a_id = SourceInstanceId::new("file:track-a");
+        let file_b_id = SourceInstanceId::new("file:track-b");
+        let file_c_id = SourceInstanceId::new("file:track-c");
+
+        let wav_a = sine_wav(4_800, 440.0);
+        let wav_b = sine_wav(4_800, 880.0);
+        let wav_c = sine_wav(4_800, 220.0);
+
+        runtime
+            .add_file_source_instance(file_request(file_a_id.as_str(), "mem://a.wav", &wav_a, 0))
+            .expect("file-a accepted");
+        runtime
+            .add_file_source_instance(file_request(file_b_id.as_str(), "mem://b.wav", &wav_b, 0))
+            .expect("file-b accepted");
+        runtime
+            .add_file_source_instance(file_request(file_c_id.as_str(), "mem://c.wav", &wav_c, 0))
+            .expect("file-c accepted");
+
+        let mut glicol = GlicolSource::new(SAMPLE_RATE);
+        glicol
+            .load_code("out: sin 660 >> mul 0.2")
+            .expect("glicol code loaded");
+        add_glicol_channel(&mut runtime, Box::new(glicol));
+
+        runtime
+            .set_source_instance_gain_db(&file_a_id, -6.0, 0)
+            .expect("a gain");
+        runtime
+            .set_source_instance_pan(&file_a_id, -1.0, 0)
+            .expect("a pan");
+        runtime
+            .set_source_instance_highpass_hz(&file_a_id, 200.0)
+            .expect("a highpass");
+
+        runtime
+            .set_source_instance_pan(&file_b_id, 1.0, 0)
+            .expect("b pan");
+        runtime
+            .set_source_instance_eq_gains_db(&file_b_id, 6.0, 0.0, -3.0, 0)
+            .expect("b eq");
+        runtime
+            .set_source_instance_lowpass_hz(&file_b_id, 5_000.0)
+            .expect("b lowpass");
+
+        runtime
+            .set_source_instance_reverb_send_db(&file_c_id, 0.0, 0)
+            .expect("c reverb");
+        runtime
+            .set_source_instance_playback_rate(&file_c_id, 2.0, 0)
+            .expect("c rate");
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
+                db: -3.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let blocks = 4;
+        let block_size = 256;
+        let mut output = vec![StereoFrame::SILENCE; block_size];
+        for _ in 0..blocks {
+            runtime.render_block(&mut output);
+        }
+
+        for (idx, frame) in output.iter().enumerate() {
+            assert!(
+                frame.left.is_finite(),
+                "left NaN/Inf at frame {idx}: {}",
+                frame.left
+            );
+            assert!(
+                frame.right.is_finite(),
+                "right NaN/Inf at frame {idx}: {}",
+                frame.right
+            );
+            assert!(
+                frame.left >= -1.0 && frame.left <= 1.0,
+                "left out of [-1,1] at frame {idx}: {}",
+                frame.left
+            );
+            assert!(
+                frame.right >= -1.0 && frame.right <= 1.0,
+                "right out of [-1,1] at frame {idx}: {}",
+                frame.right
+            );
+        }
+
+        let mixed_peak = peak(&output);
+        assert!(
+            mixed_peak > 0.05,
+            "4-source mix should be audible, got peak {mixed_peak}"
+        );
+
+        let snapshot = runtime.source_timeline_snapshot();
+
+        let snap_a = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_a_id)
+            .expect("file-a in snapshot");
+        assert_eq!(snap_a.effects.gain_db, -6.0);
+        assert_eq!(snap_a.effects.pan, -1.0);
+        assert_eq!(snap_a.effects.highpass_hz, 200.0);
+
+        let snap_b = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_b_id)
+            .expect("file-b in snapshot");
+        assert_eq!(snap_b.effects.pan, 1.0);
+        assert_eq!(snap_b.effects.eq.low_gain_db, 6.0);
+        assert_eq!(snap_b.effects.eq.mid_gain_db, 0.0);
+        assert_eq!(snap_b.effects.eq.high_gain_db, -3.0);
+        assert_eq!(snap_b.effects.lowpass_hz, 5_000.0);
+
+        let snap_c = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == file_c_id)
+            .expect("file-c in snapshot");
+        assert_eq!(snap_c.effects.reverb_send_db, 0.0);
+        assert_eq!(snap_c.effects.playback_rate, 2.0);
+
+        let snap_glicol = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id.as_str() == "glicol:main")
+            .expect("glicol in snapshot");
+        assert!(
+            (snap_glicol.effects.gain_db - -3.0).abs() < 0.001,
+            "glicol gain should be -3 dB, got {}",
+            snap_glicol.effects.gain_db
+        );
+
+        assert_eq!(snapshot.sources.len(), 4);
+    }
+
+    #[test]
+    fn multi_source_rt_effect_changes_apply_independently() {
+        let (mut runtime, mut queue, _handle) = AudioRuntime::new(AudioRuntimeConfig {
+            sample_rate: SAMPLE_RATE,
+        });
+
+        let id_a = SourceInstanceId::new("file:rt-a");
+        let id_b = SourceInstanceId::new("file:rt-b");
+        let wav = sine_wav(4_800, 440.0);
+
+        runtime
+            .add_file_source_instance(file_request(id_a.as_str(), "mem://rt-a.wav", &wav, 0))
+            .expect("rt-a accepted");
+        runtime
+            .add_file_source_instance(file_request(id_b.as_str(), "mem://rt-b.wav", &wav, 0))
+            .expect("rt-b accepted");
+
+        let mut glicol = GlicolSource::new(SAMPLE_RATE);
+        glicol
+            .load_code("out: sin 330 >> mul 0.15")
+            .expect("glicol loaded");
+        add_glicol_channel(&mut runtime, Box::new(glicol));
+
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new(id_a.as_str()),
+                db: -12.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstancePan {
+                source_instance_id: RtSourceInstanceId::new(id_a.as_str()),
+                pan: -1.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceEq {
+                source_instance_id: RtSourceInstanceId::new(id_b.as_str()),
+                low_db: 6.0,
+                mid_db: -6.0,
+                high_db: 3.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceReverbSendDb {
+                source_instance_id: RtSourceInstanceId::new(id_b.as_str()),
+                send_db: -6.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+        assert!(queue
+            .enqueue(RtCommand::SetSourceInstanceGainDb {
+                source_instance_id: RtSourceInstanceId::new("glicol:main"),
+                db: -9.0,
+                ramp_frames: 0,
+            })
+            .is_ok());
+
+        let mut output = vec![StereoFrame::SILENCE; 256];
+        runtime.render_block(&mut output);
+
+        let snapshot = runtime.source_timeline_snapshot();
+
+        let snap_a = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == id_a)
+            .expect("rt-a in snapshot");
+        assert_eq!(snap_a.effects.gain_db, -12.0);
+        assert_eq!(snap_a.effects.pan, -1.0);
+        assert_eq!(snap_a.effects.eq.low_gain_db, 0.0);
+        assert_eq!(snap_a.effects.eq.mid_gain_db, 0.0);
+        assert_eq!(snap_a.effects.eq.high_gain_db, 0.0);
+
+        let snap_b = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id == id_b)
+            .expect("rt-b in snapshot");
+        assert_eq!(snap_b.effects.gain_db, 0.0);
+        assert_eq!(snap_b.effects.pan, 0.0);
+        assert_eq!(snap_b.effects.eq.low_gain_db, 6.0);
+        assert_eq!(snap_b.effects.eq.mid_gain_db, -6.0);
+        assert_eq!(snap_b.effects.eq.high_gain_db, 3.0);
+        assert_eq!(snap_b.effects.reverb_send_db, -6.0);
+
+        let snap_glicol = snapshot
+            .sources
+            .iter()
+            .find(|s| s.source_instance_id.as_str() == "glicol:main")
+            .expect("glicol in snapshot");
+        assert!(
+            (snap_glicol.effects.gain_db - -9.0).abs() < 0.001,
+            "glicol gain should be -9 dB, got {}",
+            snap_glicol.effects.gain_db
+        );
+
+        assert_all_in_unit_range(&output);
+        assert!(peak(&output) > 0.01, "mixed output should be non-silent");
     }
 }
