@@ -1,13 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum SourceId {
-    System,
-    Mic,
-    Player,
-    Glicol,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum RtTarget {
     Master,

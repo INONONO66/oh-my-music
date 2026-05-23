@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use crate::params::SourceId;
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct SourceInstanceId(String);
@@ -13,10 +11,6 @@ impl SourceInstanceId {
 
     pub fn validate(&self) -> Result<(), SourceTimelineValidationError> {
         validate_instance_id(self.as_str())
-    }
-
-    pub fn legacy(source_id: SourceId) -> Self {
-        Self(format!("legacy:{}", legacy_source_slug(source_id)))
     }
 
     pub fn as_str(&self) -> &str {
@@ -42,17 +36,6 @@ pub enum SourceKind {
     Mic,
     File,
     Generated,
-}
-
-impl SourceKind {
-    pub fn from_legacy_source(source_id: SourceId) -> Self {
-        match source_id {
-            SourceId::System => Self::System,
-            SourceId::Mic => Self::Mic,
-            SourceId::Player => Self::File,
-            SourceId::Glicol => Self::Generated,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,12 +109,6 @@ impl SourceTimelinePlacement {
         }
     }
 
-    pub fn legacy_always_on() -> Self {
-        Self {
-            active_windows: vec![TimelineActiveWindow::open_from_start()],
-        }
-    }
-
     pub fn validate(&self) -> Result<(), SourceTimelineValidationError> {
         if self.active_windows.is_empty() {
             return Err(SourceTimelineValidationError::EmptyActiveWindows);
@@ -181,7 +158,6 @@ pub enum PlaybackState {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PlaybackStatusAuthority {
     TimelineTransport,
-    LegacyChannelEnabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -194,20 +170,6 @@ pub struct SourcePlaybackStatus {
 }
 
 impl SourcePlaybackStatus {
-    pub fn legacy_enabled(enabled: bool) -> Self {
-        Self {
-            state: if enabled {
-                PlaybackState::Playing
-            } else {
-                PlaybackState::Stopped
-            },
-            authority: PlaybackStatusAuthority::LegacyChannelEnabled,
-            timeline_position_ms: None,
-            source_position_ms: None,
-            loop_enabled: false,
-        }
-    }
-
     pub fn playing() -> Self {
         Self {
             state: PlaybackState::Playing,
@@ -273,11 +235,6 @@ impl Default for SourceEqStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LegacySourceBridge {
-    pub source_id: SourceId,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TimelineSourceInstance {
     pub source_instance_id: SourceInstanceId,
@@ -286,29 +243,12 @@ pub struct TimelineSourceInstance {
     pub timeline: SourceTimelinePlacement,
     pub playback: SourcePlaybackStatus,
     pub effects: SourceEffectStatus,
-    pub legacy_bridge: Option<LegacySourceBridge>,
 }
 
 impl TimelineSourceInstance {
     pub fn validate(&self) -> Result<(), SourceTimelineValidationError> {
         self.source_instance_id.validate()?;
         self.timeline.validate()
-    }
-
-    pub fn legacy_channel(
-        source_id: SourceId,
-        playback: SourcePlaybackStatus,
-        effects: SourceEffectStatus,
-    ) -> Self {
-        Self {
-            source_instance_id: SourceInstanceId::legacy(source_id),
-            source_kind: SourceKind::from_legacy_source(source_id),
-            asset_ref: legacy_asset_ref(source_id),
-            timeline: SourceTimelinePlacement::legacy_always_on(),
-            playback,
-            effects,
-            legacy_bridge: Some(LegacySourceBridge { source_id }),
-        }
     }
 }
 
@@ -356,72 +296,9 @@ fn validate_instance_id(value: &str) -> Result<(), SourceTimelineValidationError
     }
 }
 
-fn legacy_asset_ref(source_id: SourceId) -> Option<SourceAssetRef> {
-    match source_id {
-        SourceId::System => Some(SourceAssetRef::LiveInput {
-            label: "system".to_string(),
-        }),
-        SourceId::Mic => Some(SourceAssetRef::LiveInput {
-            label: "mic".to_string(),
-        }),
-        SourceId::Player => None,
-        SourceId::Glicol => Some(SourceAssetRef::Generated {
-            engine: GeneratedEngine::Glicol,
-            code_ref: None,
-        }),
-    }
-}
-
-fn legacy_source_slug(source_id: SourceId) -> &'static str {
-    match source_id {
-        SourceId::System => "system",
-        SourceId::Mic => "mic",
-        SourceId::Player => "player",
-        SourceId::Glicol => "glicol",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_source_instance_ids_are_stable() {
-        assert_eq!(
-            SourceInstanceId::legacy(SourceId::Mic).as_str(),
-            "legacy:mic"
-        );
-        assert_eq!(
-            SourceInstanceId::legacy(SourceId::Player).as_str(),
-            "legacy:player"
-        );
-    }
-
-    #[test]
-    fn legacy_bridge_maps_fixed_sources_into_dynamic_kinds() {
-        let player = TimelineSourceInstance::legacy_channel(
-            SourceId::Player,
-            SourcePlaybackStatus::playing(),
-            SourceEffectStatus::default(),
-        );
-        let generated = TimelineSourceInstance::legacy_channel(
-            SourceId::Glicol,
-            SourcePlaybackStatus::stopped(),
-            SourceEffectStatus::default(),
-        );
-
-        assert_eq!(player.source_kind, SourceKind::File);
-        assert_eq!(player.source_instance_id.as_str(), "legacy:player");
-        assert_eq!(player.legacy_bridge.unwrap().source_id, SourceId::Player);
-        assert_eq!(generated.source_kind, SourceKind::Generated);
-        assert!(matches!(
-            generated.asset_ref,
-            Some(SourceAssetRef::Generated {
-                engine: GeneratedEngine::Glicol,
-                ..
-            })
-        ));
-    }
 
     #[test]
     fn active_windows_cover_timeline_ranges() {
@@ -512,19 +389,24 @@ mod tests {
         let snapshot = SourceTimelineSnapshot {
             engine_frame: 960_000,
             sample_rate: 48_000,
-            sources: vec![TimelineSourceInstance::legacy_channel(
-                SourceId::Mic,
-                SourcePlaybackStatus::playing(),
-                SourceEffectStatus {
+            sources: vec![TimelineSourceInstance {
+                source_instance_id: SourceInstanceId::new("mic:default"),
+                source_kind: SourceKind::Mic,
+                asset_ref: Some(SourceAssetRef::LiveInput {
+                    label: "microphone".to_string(),
+                }),
+                timeline: SourceTimelinePlacement::always_on(),
+                playback: SourcePlaybackStatus::playing(),
+                effects: SourceEffectStatus {
                     gain_db: -6.0,
                     pan: -0.25,
                     ..SourceEffectStatus::default()
                 },
-            )],
+            }],
         };
 
         let json = serde_json::to_string(&snapshot).expect("snapshot serializes");
-        assert!(json.contains("legacy:mic"));
+        assert!(json.contains("mic:default"));
         assert!(json.contains("Mic"));
         assert!(json.contains("gain_db"));
         let decoded: SourceTimelineSnapshot =

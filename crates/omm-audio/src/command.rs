@@ -1,4 +1,3 @@
-use omm_protocol::params::SourceId;
 use ringbuf::traits::{Consumer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
@@ -70,28 +69,6 @@ pub enum RtCommand {
     },
     SetMasterHighpassHz {
         hz: f32,
-    },
-    SetChannelGainDb {
-        source_id: SourceId,
-        db: f32,
-        ramp_frames: u32,
-    },
-    SetChannelPan {
-        source_id: SourceId,
-        pan: f32,
-        ramp_frames: u32,
-    },
-    SetChannelLowpassHz {
-        source_id: SourceId,
-        hz: f32,
-    },
-    SetChannelHighpassHz {
-        source_id: SourceId,
-        hz: f32,
-    },
-    SetChannelEnabled {
-        source_id: SourceId,
-        enabled: bool,
     },
     SetSourceInstanceEnabled {
         source_instance_id: RtSourceInstanceId,
@@ -320,11 +297,6 @@ mod tests {
                 | RtCommand::SetMasterPan { .. }
                 | RtCommand::SetMasterLowpassHz { .. }
                 | RtCommand::SetMasterHighpassHz { .. }
-                | RtCommand::SetChannelGainDb { .. }
-                | RtCommand::SetChannelPan { .. }
-                | RtCommand::SetChannelLowpassHz { .. }
-                | RtCommand::SetChannelHighpassHz { .. }
-                | RtCommand::SetChannelEnabled { .. }
                 | RtCommand::SetSourceInstanceEnabled { .. }
                 | RtCommand::SetSourceInstanceGainDb { .. }
                 | RtCommand::SetSourceInstancePan { .. }
